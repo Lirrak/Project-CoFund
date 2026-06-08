@@ -1,0 +1,22 @@
+# Dependencies
+node_modules/
+
+# Expo directories
+.expo/
+dist/
+web-build/
+
+# Local SQLite databases
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS Files
+.DS_Store
+Thumbs.db
