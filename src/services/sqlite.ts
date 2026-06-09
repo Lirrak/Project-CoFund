@@ -172,6 +172,11 @@ export class LocalDB {
           FOREIGN KEY (expense_id) REFERENCES expenses(id) ON DELETE CASCADE,
           FOREIGN KEY (user_id) REFERENCES profiles(id) ON DELETE RESTRICT
         );
+
+        CREATE TABLE IF NOT EXISTS settings (
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL
+        );
       `);
       
       console.log('Database initialized successfully.');
@@ -563,6 +568,42 @@ export class LocalDB {
     } catch (error) {
       console.error('Error in withTransactionAsync:', error);
       throw error;
+    }
+  }
+
+  /**
+   * Lưu hoặc cập nhật cấu hình cài đặt dưới dạng Key-Value bền vững trong SQLite.
+   */
+  public async saveSetting(key: string, value: string): Promise<boolean> {
+    try {
+      const db = await this.getDb();
+      await db.runAsync(
+        `INSERT INTO settings (key, value) 
+         VALUES (?, ?) 
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value;`,
+        [key, value]
+      );
+      return true;
+    } catch (error) {
+      console.error(`Error saving setting "${key}":`, error);
+      return false;
+    }
+  }
+
+  /**
+   * Lấy cấu hình cài đặt theo key từ SQLite.
+   */
+  public async getSetting(key: string): Promise<string | null> {
+    try {
+      const db = await this.getDb();
+      const row = await db.getFirstAsync<{ value: string }>(
+        'SELECT value FROM settings WHERE key = ?;',
+        [key]
+      );
+      return row ? row.value : null;
+    } catch (error) {
+      console.error(`Error getting setting "${key}":`, error);
+      return null;
     }
   }
 }

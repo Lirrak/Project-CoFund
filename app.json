@@ -1,0 +1,23 @@
+{
+  "expo": {
+    "name": "CoFund Local",
+    "slug": "cofund-local",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "newArchEnabled": false,
+    "android": {
+      "package": "com.lirrak.cofundlocal",
+      "metaData": {
+        "com.google.mlkit.vision.DEPENDENCIES": "ocr"
+      }
+    },
+    "ios": {
+      "bundleIdentifier": "com.lirrak.cofundlocal"
+    },
+    "extra": {
+      "eas": {
+        "projectId": "83916695-3a27-41f2-b601-c656b3a432f3"
+      }
+    }
+  }
+}

@@ -11,6 +11,8 @@ import {
   ActivityIndicator,
   Platform,
   StatusBar,
+  Image,
+  Modal,
 } from 'react-native';
 import { LocalDB, LocalGroupMember } from '../services/sqlite';
 import {
@@ -22,6 +24,10 @@ import {
   SplitType,
   SplitInput,
 } from '../utils/splitCalculator';
+import { saveBillImageLocally } from '../services/imageStore';
+import { OCRParser } from '../services/ocrParser';
+import * as ImagePicker from 'expo-image-picker';
+import * as FileSystem from 'expo-file-system/legacy';
 
 interface TripExpensesScreenProps {
   tripId: number;
@@ -36,12 +42,17 @@ interface DisplayExpense {
   description: string;
   created_at: string;
   paidByName: string; // Tên hiển thị người trả, hoặc "Quỹ chung"
+  billImageUri?: string | null; // Đường dẫn ảnh hóa đơn cục bộ
   splits: Array<{
     displayName: string;
     ratio: number;
     calculatedAmount: number;
   }>;
 }
+
+const MODEL_DIR = `${FileSystem.documentDirectory}models/`;
+const MODEL_PATH = `${MODEL_DIR}qwen-1.5b.gguf`;
+const DEFAULT_MODEL_URL = 'https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf';
 
 function TripExpensesScreenContent({ tripId, tripName, groupId, onGoBack }: TripExpensesScreenProps) {
   const [loading, setLoading] = useState<boolean>(true);
@@ -62,11 +73,42 @@ function TripExpensesScreenContent({ tripId, tripName, groupId, onGoBack }: Trip
   const [memberPercents, setMemberPercents] = useState<Record<number, string>>({}); // Lưu trữ % tùy chọn
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
 
+  // Cấu hình OCR AI & Local LLM
+  const [billImageUri, setBillImageUri] = useState<string | null>(null);
+  const [ocrLoading, setOcrLoading] = useState<boolean>(false);
+  const [aiMode, setAiMode] = useState<'heuristics' | 'llamacpp' | 'ondevice_llm'>('heuristics');
+  const [llamaServerUrl, setLlamaServerUrl] = useState<string>('http://192.168.1.50:8080');
+  const [showAiSettings, setShowAiSettings] = useState<boolean>(false);
+  const [previewImageUri, setPreviewImageUri] = useState<string | null>(null);
+
+  // Trạng thái tải mô hình AI On-Device (.gguf)
+  const [isDownloadingModel, setIsDownloadingModel] = useState<boolean>(false);
+  const [modelDownloadProgress, setModelDownloadProgress] = useState<number>(0);
+  const [isModelReady, setIsModelReady] = useState<boolean>(false);
+
   // Tải toàn bộ dữ liệu liên quan
   const loadData = async () => {
     try {
       setLoading(true);
       const db = LocalDB.getInstance();
+
+      // 0. Tải cấu hình cài đặt AI từ SQLite
+      try {
+        const savedAiMode = await db.getSetting('ai_mode');
+        if (savedAiMode === 'heuristics' || savedAiMode === 'llamacpp' || savedAiMode === 'ondevice_llm') {
+          setAiMode(savedAiMode);
+        }
+        const savedLlamaUrl = await db.getSetting('llama_server_url');
+        if (savedLlamaUrl) {
+          setLlamaServerUrl(savedLlamaUrl);
+        }
+
+        // Kiểm tra xem mô hình AI On-Device đã được tải về máy chưa
+        const modelInfo = await FileSystem.getInfoAsync(MODEL_PATH);
+        setIsModelReady(modelInfo.exists);
+      } catch (err) {
+        console.warn('Could not read settings, maybe tables are initializing...', err);
+      }
 
       // 1. Tính toán số dư ròng (Net Balance) của các thành viên trong nhóm
       const states = await calculateMemberNetBalances(groupId);
@@ -88,7 +130,7 @@ function TripExpensesScreenContent({ tripId, tripName, groupId, onGoBack }: Trip
       // 4. Lấy danh sách hóa đơn chi tiêu kèm thông tin splits của chuyến đi này
       // Sử dụng LEFT JOIN để lấy được cả hóa đơn có paid_by là NULL (Chi từ quỹ chung)
       const expenseRows = await db.getAllAsync<any>(
-        `SELECT e.id, e.total_amount, e.description, e.created_at, p.display_name as paidByName
+        `SELECT e.id, e.total_amount, e.description, e.bill_image_uri, e.created_at, p.display_name as paidByName
          FROM expenses e
          LEFT JOIN profiles p ON e.paid_by = p.id
          WHERE e.trip_id = ?
@@ -119,6 +161,7 @@ function TripExpensesScreenContent({ tripId, tripName, groupId, onGoBack }: Trip
           description: exp.description || 'Chi tiêu không tên',
           created_at: exp.created_at,
           paidByName: exp.paidByName || '🏦 Quỹ chung',
+          billImageUri: exp.bill_image_uri,
           splits: itemSplits,
         };
       });
@@ -181,7 +224,7 @@ function TripExpensesScreenContent({ tripId, tripName, groupId, onGoBack }: Trip
         paidByUserId, // số ID hoặc null
         Number(amount),
         description.trim(),
-        '', // bỏ trống ảnh hóa đơn
+        billImageUri || '', // Lưu trữ ảnh hóa đơn cục bộ (nếu có)
         splitsInput,
         splitType
       );
@@ -190,6 +233,7 @@ function TripExpensesScreenContent({ tripId, tripName, groupId, onGoBack }: Trip
         Alert.alert('Thành công', 'Đã ghi nhận chi tiêu và tự động hạch toán số dư ròng thành công!');
         setAmount('');
         setDescription('');
+        setBillImageUri(null); // Reset đường dẫn ảnh hóa đơn
         setMemberPercents({});
         // Reload lại toàn bộ dữ liệu
         await loadData();
@@ -200,6 +244,433 @@ function TripExpensesScreenContent({ tripId, tripName, groupId, onGoBack }: Trip
       Alert.alert('Lỗi', 'Không thể ghi nhận hóa đơn. Hãy kiểm tra lại kết nối cơ sở dữ liệu.');
     } finally {
       setIsSubmitting(false);
+    }
+  };
+
+  // Lưu cài đặt AI bền vững vào SQLite
+  const saveAiSetting = async (key: string, value: string) => {
+    const db = LocalDB.getInstance();
+    await db.saveSetting(key, value);
+  };
+
+  // Hàm gọi API tới Local Llama.cpp Server để phân tích văn bản hóa đơn
+  const parseAmountWithLlamaCpp = async (ocrLines: string[]): Promise<number | null> => {
+    const fullText = ocrLines.join('\n');
+    const prompt = `Bạn là trợ lý AI chuyên nghiệp phân tích hóa đơn tiếng Việt. 
+Hãy đọc dữ liệu văn bản bóc tách từ hóa đơn dưới đây, tìm ra số tiền tổng cộng (Total Amount) cần thanh toán.
+Yêu cầu bắt buộc: Trả về duy nhất một chuỗi JSON có định dạng: {"total_amount": số_tiền_chuyển_đổi_thành_số_nguyên}. Không giải thích gì thêm ngoài JSON.
+
+Dữ liệu hóa đơn OCR:
+"""
+${fullText}
+"""`;
+
+    try {
+      const response = await fetch(`${llamaServerUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: "qwen",
+          messages: [{ role: "user", content: prompt }],
+          temperature: 0.1,
+        }),
+      });
+
+      const data = await response.json();
+      const reply = data.choices[0].message.content.trim();
+      
+      // Tìm và trích xuất JSON từ câu trả lời của LLM
+      const jsonMatch = reply.match(/\{.*\}/s);
+      if (jsonMatch) {
+        const parsed = JSON.parse(jsonMatch[0]);
+        return parsed.total_amount || null;
+      }
+      return null;
+    } catch (error) {
+      console.error('Lỗi kết nối tới local llama.cpp server:', error);
+      Alert.alert(
+        'Lỗi kết nối AI', 
+        'Không thể kết nối tới máy chủ Llama.cpp nội bộ. Vui lòng kiểm tra địa chỉ IP hoặc chuyển sang chế độ Heuristics Offline.'
+      );
+      return null;
+    }
+  };
+
+  // Hàm tải mô hình GGUF từ URL về thư mục cục bộ của ứng dụng
+  const handleDownloadModel = async () => {
+    try {
+      setIsDownloadingModel(true);
+      setModelDownloadProgress(0);
+
+      // Đảm bảo thư mục models/ tồn tại
+      const dirInfo = await FileSystem.getInfoAsync(MODEL_DIR);
+      if (!dirInfo.exists) {
+        await FileSystem.makeDirectoryAsync(MODEL_DIR, { intermediates: true });
+      }
+
+      // Thiết lập download resumable kèm callback cập nhật tiến trình %
+      const callback = (downloadProgress: any) => {
+        const progress = downloadProgress.totalBytesWritten / downloadProgress.totalBytesExpectedToWrite;
+        setModelDownloadProgress(Math.round(progress * 100));
+      };
+
+      const downloadResumable = FileSystem.createDownloadResumable(
+        DEFAULT_MODEL_URL,
+        MODEL_PATH,
+        {},
+        callback
+      );
+
+      const result = await downloadResumable.downloadAsync();
+      if (result && result.uri) {
+        setIsModelReady(true);
+        Alert.alert(
+          'Tải mô hình thành công! 🎉',
+          'Mô hình AI Qwen (1.5B) đã được lưu thành công trên thiết bị của bạn. Bạn đã sẵn sàng sử dụng trí tuệ nhân tạo offline 100%!'
+        );
+      }
+    } catch (error: any) {
+      console.error('Error downloading model:', error);
+      Alert.alert('Lỗi tải mô hình', error?.message || 'Có lỗi xảy ra trong quá trình tải mô hình AI.');
+    } finally {
+      setIsDownloadingModel(false);
+    }
+  };
+
+  // Gọi mô hình AI Llama.cpp trực tiếp TRÊN ĐIỆN THOẠI (On-Device Inference)
+  const parseAmountWithOnDeviceLlama = async (ocrLines: string[]): Promise<number | null> => {
+    const fullText = ocrLines.join('\n');
+    const prompt = `Bạn là trợ lý AI chuyên nghiệp phân tích hóa đơn tiếng Việt. 
+Hãy đọc dữ liệu văn bản bóc tách từ hóa đơn dưới đây, tìm ra số tiền tổng cộng (Total Amount) cần thanh toán.
+Yêu cầu bắt buộc: Trả về duy nhất một chuỗi JSON có định dạng: {"total_amount": số_tiền_chuyển_đổi_thành_số_nguyên}. Không giải thích gì thêm ngoài JSON.
+
+Dữ liệu hóa đơn OCR:
+"""
+${fullText}
+"""`;
+
+    // 1. Kiểm tra xem thư viện native react-native-llama có sẵn và hoạt động không
+    let isLlamaLinked = false;
+    try {
+      // Thử load động thư viện native để tránh lỗi biên dịch trên môi trường Expo Go
+      const LlamaModule = require('react-native-llama');
+      if (LlamaModule && LlamaModule.initLlama) {
+        isLlamaLinked = true;
+      }
+    } catch (e) {
+      console.warn('react-native-llama is not linked in this build.');
+    }
+
+    if (!isLlamaLinked) {
+      // Nếu không có native linking (chạy trong Expo Go hoặc chưa rebuilt), ném một lỗi cụ thể để kích hoạt Trình giả lập On-Device
+      throw new Error("unlinked: Thư viện native 'react-native-llama' chưa được tích hợp vào build này.");
+    }
+
+    // 2. Chạy suy luận native on-device thực tế qua react-native-llama
+    try {
+      const LlamaModule = require('react-native-llama');
+      
+      console.log('Initializing on-device llama context from:', MODEL_PATH);
+      const context = await LlamaModule.initLlama({
+        model: MODEL_PATH,
+        use_mlock: true,
+        n_ctx: 1024,
+      });
+
+      console.log('Running on-device LLM inference...');
+      const response = await context.completion({
+        prompt: prompt,
+        temperature: 0.1,
+      });
+
+      const reply = response.text.trim();
+      console.log('On-device LLM reply:', reply);
+
+      // Tìm và giải mã JSON
+      const jsonMatch = reply.match(/\{.*\}/s);
+      if (jsonMatch) {
+        const parsed = JSON.parse(jsonMatch[0]);
+        return parsed.total_amount || null;
+      }
+      return null;
+    } catch (error) {
+      console.error('Error in on-device llama inference:', error);
+      throw error;
+    }
+  };
+
+  // Xử lý luồng chạy OCR offline & bóc tách số tiền
+  const handleProcessImage = async (tempUri: string) => {
+    try {
+      setOcrLoading(true);
+      
+      // 1. Sao chép ảnh vào thư mục ứng dụng chính thức lâu dài
+      const savedUri = await saveBillImageLocally(tempUri);
+      setBillImageUri(savedUri);
+
+      // 2. Chạy OCR Offline bóc tách chữ tiếng Việt bằng Google ML Kit
+      const lines = await OCRParser.detectReceiptText(savedUri);
+      
+      if (lines.length === 0) {
+        Alert.alert('Nhận diện chữ', 'Không phát hiện được ký tự nào trên hóa đơn này. Vui lòng nhập số tiền thủ công.');
+        return;
+      }
+
+      console.log('Detected OCR lines:', lines);
+
+      // 3. Phân tích bóc tách số tiền dựa trên cấu hình AI Mode
+      let detectedAmount: number | null = null;
+      if (aiMode === 'heuristics') {
+        // Chế độ 1: Dùng Heuristics offline nhanh <1s
+        detectedAmount = OCRParser.extractBillAmount(lines);
+      } else if (aiMode === 'llamacpp') {
+        // Chế độ 2: Dùng Llama.cpp Local Server
+        detectedAmount = await parseAmountWithLlamaCpp(lines);
+      } else if (aiMode === 'ondevice_llm') {
+        // Chế độ 3: Chạy Llama.cpp trực tiếp trên điện thoại!
+        if (!isModelReady) {
+          Alert.alert(
+            'Chưa tải mô hình AI 📥',
+            'Bạn cần tải mô hình AI Qwen (1.5B) về điện thoại trước khi sử dụng chế độ On-Device LLM.\n\nVui lòng vào phần Cài đặt AI của biểu mẫu hóa đơn và bấm nút "Tải mô hình AI On-Device".'
+          );
+          return;
+        }
+        detectedAmount = await parseAmountWithOnDeviceLlama(lines);
+      }
+
+      // 4. Cập nhật kết quả vào form nhập liệu nếu tìm thấy số tiền hợp lệ
+      if (detectedAmount && detectedAmount > 0) {
+        setAmount(detectedAmount.toString());
+        // Điền mô tả gợi ý kèm tên ảnh hóa đơn
+        const timeStr = new Date().toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit' });
+        setDescription(`Hóa đơn tự động quét lúc ${timeStr}`);
+        Alert.alert(
+          'AI Nhận diện thành công 🎉', 
+          `Đã phát hiện số tiền: ${detectedAmount.toLocaleString('vi-VN')} đ.\nSố tiền và mô tả gợi ý đã được điền tự động vào biểu mẫu.`
+        );
+      } else {
+        Alert.alert(
+          'Không tìm thấy số tiền', 
+          'AI đã đọc được chữ nhưng không xác định chắc chắn được Số tiền tổng của hóa đơn. Vui lòng tự điền số tiền.'
+        );
+      }
+
+    } catch (error: any) {
+      console.warn('Error processing bill image:', error);
+      const errorMsg = error?.message || '';
+      
+      // Kiểm tra xem có phải lỗi do thiếu native linking (chạy trong Expo Go) hay không
+      if (
+        errorMsg.includes("doesn't seem to be linked") || 
+        errorMsg.includes("unlinked") || 
+        errorMsg.includes("NativeModules") ||
+        errorMsg.includes("null is not an object")
+      ) {
+        Alert.alert(
+          'Môi trường Expo Go 💡',
+          'Tính năng Google ML Kit OCR Offline yêu cầu phải chạy trên bản Build Native (hoặc Development Client).\n\nBạn có muốn kích hoạt "Trình giả lập OCR" để kiểm thử đầy đủ các luồng hoạt động (lưu trữ ảnh cục bộ, hạch toán SQLite, vẽ biểu đồ, xem ảnh thu phóng) ngay trong Expo Go không?',
+          [
+            {
+              text: 'Nhập thủ công',
+              style: 'cancel',
+            },
+            {
+              text: 'Chạy Giả lập',
+              style: 'default',
+              onPress: async () => {
+                try {
+                  setOcrLoading(true);
+                  // Giả lập lưu ảnh chụp cục bộ vào FileSystem
+                  const savedUri = await saveBillImageLocally(tempUri);
+                  setBillImageUri(savedUri);
+
+                  // Danh sách các loại hóa đơn Việt Nam giả lập đa dạng để kiểm thử sinh động
+                  const mockBills = [
+                    {
+                      name: 'QUÁN KHÓI (Tân Bình)',
+                      description: 'QUÁN KHÓI (Hóa đơn quét giả lập)',
+                      lines: [
+                        'QUÁN KHÓI',
+                        '06 Tân Kỳ Tân Quý, P.15, Q. Tân Bình, HCM',
+                        'PHIẾU THANH TOÁN',
+                        'Khu: A',
+                        'Bàn: 1',
+                        'Tên món SL ĐG T.Tiền',
+                        'Cà tím nướng mỡ hành 1 36,000 36,000',
+                        'Bông cải xào dầu hào 1 36,000 36,000',
+                        'Bầu luộc hột vịt 1 36,000 36,000',
+                        'Zet 1 22,000 22,000',
+                        '555 xanh 1 32,000 32,000',
+                        'Ken chai 1 18,000 18,000',
+                        'Tổng cộng',
+                        '180,000'
+                      ]
+                    },
+                    {
+                      name: 'Cà phê Hoàng Phúc (Cần Thơ)',
+                      description: 'Cà phê Hoàng Phúc (Hóa đơn quét giả lập)',
+                      lines: [
+                        'CÀ PHÊ HOÀNG PHÚC',
+                        'Đường Số 24 KDC An Khánh, P. An Khánh',
+                        'ĐT: 0974.300.007 - 0909.191.195',
+                        'HÓA ĐƠN BÁN HÀNG',
+                        'Bàn 05',
+                        'Ngày: 18/02/2019 Số: 021900003',
+                        'Thu ngân: Administrator',
+                        'Mặt hàng SL Giá T tiền',
+                        'Cà phê đá 1 10,000 10,000',
+                        'Bún thịt Xào 1 15,000 15,000',
+                        'Cà phê sữa đá 1 12,000 12,000',
+                        'Cơm tấm 1 17,000 17,000',
+                        'Tổng:',
+                        '54,000'
+                      ]
+                    },
+                    {
+                      name: 'Ẩm Thực GÁNH (Đà Nẵng)',
+                      description: 'Ẩm Thực GÁNH (Hóa đơn quét giả lập)',
+                      lines: [
+                        'Ẩm Thực GÁNH',
+                        '02 Ngô Thì Sĩ - TP Đà Nẵng',
+                        'HOÁ ĐƠN TẠM TÍNH',
+                        'Bàn: TẦNG 1 - 10 A',
+                        'Tên món SL Đ.Giá T. Tiền',
+                        'Ram chả cá 1 35 000 35 000',
+                        'Bún đậu Gánh 1 50 000 50 000',
+                        'Cá viên chiên 1 25 000 25 000',
+                        'Chè gánh 1 20 000 20 000',
+                        'Tổng Tiền Thanh Toán:       130 000'
+                      ]
+                    },
+                    {
+                      name: 'ShopeeFood (Grab)',
+                      description: 'GrabFood (Hóa đơn quét giả lập)',
+                      lines: [
+                        '220.000',
+                        '1 220.000',
+                        'Tổng tiền sản phẩm',
+                        'đ220.000',
+                        'Giá sản phẩm',
+                        'đ220.000',
+                        'Phí vận chuyển ước tính',
+                        'đ0',
+                        'Phụ phí',
+                        '-đ63.500',
+                        'Thuế',
+                        '-đ3.300',
+                        'Tổng thu đơn hàng ước tính',
+                        'đ153.200'
+                      ]
+                    },
+                    {
+                      name: 'Highlands Coffee',
+                      description: 'Highlands Coffee (Hóa đơn quét giả lập)',
+                      lines: [
+                        'HIGHLANDS COFFEE',
+                        'ĐC: 135 Nguyễn Huệ, Q.1',
+                        'Phin Sữa Đá Size L: 45.000',
+                        'Trà Đào Thanh Đào Size M: 49.000',
+                        'Bánh Mì Thịt Nướng: 31.000',
+                        'CỘNG TIỀN HÀNG: 125.000',
+                        'Thành tiền: 125.000',
+                        'Cảm ơn quý khách!'
+                      ]
+                    },
+                    {
+                      name: 'Taxi Mai Linh',
+                      description: 'Taxi Mai Linh (Hóa đơn quét giả lập)',
+                      lines: [
+                        'TAXI MAI LINH',
+                        'SỐ XE: 4321',
+                        'QUÃNG ĐƯỜNG: 5.2 KM',
+                        'ĐƠN GIÁ: 15.000/KM',
+                        'TỔNG CỘNG THANH TOÁN',
+                        '85.000 đ',
+                        'CẢM ƠN QUÝ KHÁCH!'
+                      ]
+                    },
+                    {
+                      name: 'Nhà hàng Hải Sản',
+                      description: 'Nhà hàng Hải Sản (Hóa đơn quét giả lập)',
+                      lines: [
+                        'NHÀ HÀNG HẢI SẢN PHỐ BIỂN',
+                        'Lẩu hải sản thập cẩm: 450.000',
+                        'Cua hoàng đế hấp sả: 650.000',
+                        'Nước ngọt lon x5: 150.000',
+                        'Tổng cộng chưa thuế: 1.250.000',
+                        'Thuế VAT 10%: 125.000',
+                        'TỔNG TIỀN THANH TOÁN',
+                        '1.250.000 đ'
+                      ]
+                    }
+                  ];
+
+                  // Lựa chọn ngẫu nhiên một loại hóa đơn để quét giả lập sinh động
+                  const selectedBill = mockBills[Math.floor(Math.random() * mockBills.length)];
+
+                  // Chạy trực tiếp qua thuật toán Heuristic Parser vừa cải tiến của ocrParser
+                  const detectedAmount = OCRParser.extractBillAmount(selectedBill.lines);
+                  if (detectedAmount && detectedAmount > 0) {
+                    setAmount(detectedAmount.toString());
+                    setDescription(selectedBill.description);
+                    Alert.alert(
+                      `Giả lập thành công [${selectedBill.name}] 🎉`,
+                      `Đã giả lập quét thành công số tiền: ${detectedAmount.toLocaleString('vi-VN')} đ.\n\nBạn có thể nhấn nút "Lưu hóa đơn" để trải nghiệm hạch toán SQLite và bấm "Xem ảnh" ở Lịch sử.`
+                    );
+                  }
+                } catch (simError: any) {
+                  console.error('Simulated OCR error:', simError);
+                  Alert.alert('Lỗi giả lập', simError?.message || 'Không thể lưu ảnh hóa đơn cục bộ.');
+                } finally {
+                  setOcrLoading(false);
+                }
+              }
+            }
+          ]
+        );
+      } else {
+        Alert.alert('Lỗi phân tích', error?.message || 'Có lỗi xảy ra khi xử lý ảnh hóa đơn.');
+      }
+    } finally {
+      setOcrLoading(false);
+    }
+  };
+
+  // Kích hoạt camera chụp ảnh hóa đơn mới
+  const handleCaptureInvoice = async () => {
+    const { status } = await ImagePicker.requestCameraPermissionsAsync();
+    if (status !== 'granted') {
+      Alert.alert('Quyền truy cập', 'Vui lòng cấp quyền truy cập Camera trong Cài đặt thiết bị để chụp ảnh hóa đơn.');
+      return;
+    }
+
+    const result = await ImagePicker.launchCameraAsync({
+      mediaTypes: ImagePicker.MediaTypeOptions.Images,
+      allowsEditing: true,
+      quality: 0.9,
+    });
+
+    if (!result.canceled && result.assets && result.assets.length > 0) {
+      await handleProcessImage(result.assets[0].uri);
+    }
+  };
+
+  // Kích hoạt thư viện chọn ảnh hóa đơn có sẵn
+  const handlePickInvoice = async () => {
+    const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
+    if (status !== 'granted') {
+      Alert.alert('Quyền truy cập', 'Vui lòng cấp quyền truy cập Thư viện ảnh để chọn ảnh hóa đơn.');
+      return;
+    }
+
+    const result = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ImagePicker.MediaTypeOptions.Images,
+      allowsEditing: true,
+      quality: 0.9,
+    });
+
+    if (!result.canceled && result.assets && result.assets.length > 0) {
+      await handleProcessImage(result.assets[0].uri);
     }
   };
 
@@ -365,7 +836,17 @@ function TripExpensesScreenContent({ tripId, tripName, groupId, onGoBack }: Trip
                       </View>
                     ))}
                   </View>
-                  <Text style={styles.expenseDate}>{exp.created_at}</Text>
+                  <View style={styles.expenseFooterRow}>
+                    <Text style={styles.expenseDate}>{exp.created_at}</Text>
+                    {exp.billImageUri ? (
+                      <TouchableOpacity 
+                        style={styles.viewBillBadge}
+                        onPress={() => setPreviewImageUri(exp.billImageUri || null)}
+                      >
+                        <Text style={styles.viewBillBadgeText}>📄 Xem ảnh hóa đơn</Text>
+                      </TouchableOpacity>
+                    ) : null}
+                  </View>
                 </View>
               ))
             )}
@@ -378,6 +859,134 @@ function TripExpensesScreenContent({ tripId, tripName, groupId, onGoBack }: Trip
             <View style={styles.card}>
               <Text style={styles.cardTitle}>➕ Ghi nhận hóa đơn mới</Text>
               
+              {/* KHU VỰC THIẾT LẬP AI OCR */}
+              <View style={styles.aiConfigContainer}>
+                <View style={styles.aiConfigHeader}>
+                  <Text style={styles.aiConfigTitle}>🤖 Động cơ AI phân tích hóa đơn</Text>
+                  <TouchableOpacity onPress={() => setShowAiSettings(!showAiSettings)}>
+                    <Text style={styles.aiSettingsToggle}>{showAiSettings ? '▼ Ẩn cấu hình' : '⚙️ Cài đặt'}</Text>
+                  </TouchableOpacity>
+                </View>
+
+                {showAiSettings && (
+                  <View style={styles.aiSettingsBox}>
+                    <Text style={styles.aiSettingsLabel}>Chế độ nhận diện:</Text>
+                    <View style={styles.aiModeRow}>
+                      <TouchableOpacity
+                        style={[styles.aiModeButton, aiMode === 'heuristics' && styles.aiModeButtonActive]}
+                        onPress={async () => {
+                          setAiMode('heuristics');
+                          await saveAiSetting('ai_mode', 'heuristics');
+                        }}
+                      >
+                        <Text style={[styles.aiModeButtonText, aiMode === 'heuristics' && styles.aiModeButtonTextActive]}>
+                          ⚡ Heuristics
+                        </Text>
+                      </TouchableOpacity>
+                      <TouchableOpacity
+                        style={[styles.aiModeButton, aiMode === 'llamacpp' && styles.aiModeButtonActive]}
+                        onPress={async () => {
+                          setAiMode('llamacpp');
+                          await saveAiSetting('ai_mode', 'llamacpp');
+                        }}
+                      >
+                        <Text style={[styles.aiModeButtonText, aiMode === 'llamacpp' && styles.aiModeButtonTextActive]}>
+                          💻 Laptop Server
+                        </Text>
+                      </TouchableOpacity>
+                      <TouchableOpacity
+                        style={[styles.aiModeButton, aiMode === 'ondevice_llm' && styles.aiModeButtonActive]}
+                        onPress={async () => {
+                          setAiMode('ondevice_llm');
+                          await saveAiSetting('ai_mode', 'ondevice_llm');
+                        }}
+                      >
+                        <Text style={[styles.aiModeButtonText, aiMode === 'ondevice_llm' && styles.aiModeButtonTextActive]}>
+                          📱 On-Device LLM
+                        </Text>
+                      </TouchableOpacity>
+                    </View>
+
+                    {aiMode === 'llamacpp' && (
+                      <View style={styles.llamaUrlContainer}>
+                        <Text style={styles.aiSettingsLabel}>Llama Server API URL:</Text>
+                        <TextInput
+                          style={styles.llamaUrlInput}
+                          value={llamaServerUrl}
+                          onChangeText={async (val) => {
+                            setLlamaServerUrl(val);
+                            await saveAiSetting('llama_server_url', val);
+                          }}
+                          placeholder="http://192.168.1.50:8080"
+                        />
+                      </View>
+                    )}
+
+                    {aiMode === 'ondevice_llm' && (
+                      <View style={styles.llamaUrlContainer}>
+                        <Text style={styles.aiSettingsLabel}>Mô hình AI cục bộ trên điện thoại (Offline):</Text>
+                        {isModelReady ? (
+                          <View style={styles.modelReadyBox}>
+                            <Text style={styles.modelReadyText}>✅ Qwen-1.5B đã sẵn sàng (950MB)</Text>
+                            <TouchableOpacity onPress={handleDownloadModel} style={styles.modelRedownloadBtn}>
+                              <Text style={styles.modelRedownloadText}>Tải lại 🔄</Text>
+                            </TouchableOpacity>
+                          </View>
+                        ) : (
+                          <View>
+                            {isDownloadingModel ? (
+                              <View style={styles.downloadProgressBox}>
+                                <Text style={styles.downloadProgressText}>📥 Đang tải mô hình: {modelDownloadProgress}%</Text>
+                                <View style={styles.progressBarBg}>
+                                  <View style={[styles.progressBarFill, { width: `${modelDownloadProgress}%` }]} />
+                                </View>
+                              </View>
+                            ) : (
+                              <TouchableOpacity style={styles.downloadModelBtn} onPress={handleDownloadModel}>
+                                <Text style={styles.downloadModelBtnText}>📥 Tải mô hình AI On-Device (~950MB)</Text>
+                              </TouchableOpacity>
+                            )}
+                          </View>
+                        )}
+                      </View>
+                    )}
+                  </View>
+                )}
+
+                {/* NÚT CHỤP / CHỌN ẢNH HOÁ ĐƠN */}
+                <View style={styles.ocrButtonRow}>
+                  <TouchableOpacity style={styles.ocrTriggerButton} onPress={handleCaptureInvoice}>
+                    <Text style={styles.ocrTriggerButtonText}>📸 Chụp hóa đơn</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity style={[styles.ocrTriggerButton, styles.ocrTriggerGalleryButton]} onPress={handlePickInvoice}>
+                    <Text style={styles.ocrTriggerButtonText}>🖼️ Chọn từ máy</Text>
+                  </TouchableOpacity>
+                </View>
+
+                {/* TRẠNG THÁI LOADING PHÂN TÍCH */}
+                {ocrLoading && (
+                  <View style={styles.ocrLoadingBox}>
+                    <ActivityIndicator size="small" color="#1E3A8A" />
+                    <Text style={styles.ocrLoadingText}>AI đang phân tích hóa đơn...</Text>
+                  </View>
+                )}
+
+                {/* XEM TRƯỚC ẢNH HOÁ ĐƠN ĐÃ LƯU */}
+                {billImageUri && (
+                  <View style={styles.billPreviewCard}>
+                    <Image source={{ uri: billImageUri }} style={styles.billPreviewThumbnail} />
+                    <View style={styles.billPreviewInfo}>
+                      <Text style={styles.billPreviewFileName} numberOfLines={1}>
+                        {billImageUri.split('/').pop()}
+                      </Text>
+                      <TouchableOpacity onPress={() => setBillImageUri(null)}>
+                        <Text style={styles.billPreviewDeleteBtn}>✕ Gỡ ảnh</Text>
+                      </TouchableOpacity>
+                    </View>
+                  </View>
+                )}
+              </View>
+
               <Text style={styles.inputLabel}>Mô tả khoản chi *</Text>
               <TextInput
                 style={styles.input}
@@ -539,6 +1148,32 @@ function TripExpensesScreenContent({ tripId, tripName, groupId, onGoBack }: Trip
         {/* Khoảng trống ở dưới ScrollView */}
         <View style={{ height: 40 }} />
       </ScrollView>
+
+      {/* MODAL PHÓNG TO XEM ẢNH HOÁ ĐƠN TRONG LỊCH SỬ */}
+      <Modal
+        visible={previewImageUri !== null}
+        transparent={true}
+        animationType="fade"
+        onRequestClose={() => setPreviewImageUri(null)}
+      >
+        <SafeAreaView style={styles.modalBackground}>
+          <TouchableOpacity 
+            style={styles.modalCloseButton} 
+            onPress={() => setPreviewImageUri(null)}
+          >
+            <Text style={styles.modalCloseButtonText}>✕ Đóng</Text>
+          </TouchableOpacity>
+          <View style={styles.modalImageContainer}>
+            {previewImageUri && (
+              <Image 
+                source={{ uri: previewImageUri }} 
+                style={styles.modalFullImage} 
+                resizeMode="contain" 
+              />
+            )}
+          </View>
+        </SafeAreaView>
+      </Modal>
     </SafeAreaView>
   );
 }
@@ -1013,6 +1648,269 @@ const styles = StyleSheet.create({
     color: '#78350F',
     lineHeight: 16,
     marginBottom: 4,
+  },
+  aiConfigContainer: {
+    backgroundColor: '#F3F4F6',
+    borderRadius: 12,
+    padding: 12,
+    marginBottom: 16,
+    borderWidth: 1,
+    borderColor: '#E5E7EB',
+  },
+  aiConfigHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 8,
+  },
+  aiConfigTitle: {
+    fontSize: 13,
+    fontWeight: 'bold',
+    color: '#1E3A8A',
+  },
+  aiSettingsToggle: {
+    fontSize: 12,
+    color: '#3B82F6',
+    fontWeight: '600',
+  },
+  aiSettingsBox: {
+    backgroundColor: '#FFFFFF',
+    borderRadius: 8,
+    padding: 10,
+    marginBottom: 12,
+    borderWidth: 1,
+    borderColor: '#E5E7EB',
+  },
+  aiSettingsLabel: {
+    fontSize: 11,
+    color: '#4B5563',
+    fontWeight: '600',
+    marginBottom: 4,
+  },
+  aiModeRow: {
+    flexDirection: 'row',
+    gap: 8,
+    marginBottom: 8,
+  },
+  aiModeButton: {
+    flex: 1,
+    backgroundColor: '#F3F4F6',
+    borderRadius: 6,
+    paddingVertical: 8,
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#D1D5DB',
+  },
+  aiModeButtonActive: {
+    backgroundColor: '#DBEAFE',
+    borderColor: '#3B82F6',
+  },
+  aiModeButtonText: {
+    fontSize: 11,
+    color: '#4B5563',
+    fontWeight: '500',
+  },
+  aiModeButtonTextActive: {
+    color: '#1E3A8A',
+    fontWeight: 'bold',
+  },
+  llamaUrlContainer: {
+    marginTop: 4,
+  },
+  llamaUrlInput: {
+    backgroundColor: '#F3F4F6',
+    borderRadius: 6,
+    paddingHorizontal: 8,
+    paddingVertical: 6,
+    fontSize: 12,
+    color: '#1F2937',
+    borderWidth: 1,
+    borderColor: '#D1D5DB',
+  },
+  modelReadyBox: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    backgroundColor: '#ECFDF5',
+    borderRadius: 6,
+    padding: 8,
+    borderWidth: 1,
+    borderColor: '#A7F3D0',
+    marginTop: 4,
+  },
+  modelReadyText: {
+    fontSize: 12,
+    color: '#065F46',
+    fontWeight: '600',
+  },
+  modelRedownloadBtn: {
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    backgroundColor: '#D1FAE5',
+    borderRadius: 4,
+  },
+  modelRedownloadText: {
+    fontSize: 11,
+    color: '#047857',
+    fontWeight: 'bold',
+  },
+  downloadProgressBox: {
+    backgroundColor: '#F9FAFB',
+    borderRadius: 6,
+    padding: 10,
+    borderWidth: 1,
+    borderColor: '#E5E7EB',
+    marginTop: 4,
+  },
+  downloadProgressText: {
+    fontSize: 12,
+    color: '#1E3A8A',
+    fontWeight: 'bold',
+    marginBottom: 6,
+  },
+  progressBarBg: {
+    height: 8,
+    backgroundColor: '#E5E7EB',
+    borderRadius: 4,
+    overflow: 'hidden',
+  },
+  progressBarFill: {
+    height: '100%',
+    backgroundColor: '#3B82F6',
+    borderRadius: 4,
+  },
+  downloadModelBtn: {
+    backgroundColor: '#3B82F6',
+    borderRadius: 6,
+    paddingVertical: 10,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginTop: 4,
+  },
+  downloadModelBtnText: {
+    color: '#FFFFFF',
+    fontWeight: 'bold',
+    fontSize: 12,
+  },
+  ocrButtonRow: {
+    flexDirection: 'row',
+    gap: 10,
+  },
+  ocrTriggerButton: {
+    flex: 1,
+    backgroundColor: '#3B82F6',
+    borderRadius: 8,
+    paddingVertical: 10,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  ocrTriggerGalleryButton: {
+    backgroundColor: '#6B7280',
+  },
+  ocrTriggerButtonText: {
+    color: '#FFFFFF',
+    fontWeight: 'bold',
+    fontSize: 13,
+  },
+  ocrLoadingBox: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#EFF6FF',
+    borderRadius: 8,
+    paddingVertical: 8,
+    marginTop: 10,
+    gap: 6,
+  },
+  ocrLoadingText: {
+    fontSize: 12,
+    color: '#1E3A8A',
+    fontWeight: '500',
+  },
+  billPreviewCard: {
+    flexDirection: 'row',
+    backgroundColor: '#FFFFFF',
+    borderRadius: 8,
+    padding: 8,
+    marginTop: 10,
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#E5E7EB',
+  },
+  billPreviewThumbnail: {
+    width: 44,
+    height: 44,
+    borderRadius: 6,
+    backgroundColor: '#E5E7EB',
+  },
+  billPreviewInfo: {
+    flex: 1,
+    marginLeft: 10,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
+  billPreviewFileName: {
+    fontSize: 12,
+    color: '#4B5563',
+    fontWeight: '500',
+    flex: 1,
+    marginRight: 8,
+  },
+  billPreviewDeleteBtn: {
+    fontSize: 11,
+    color: '#EF4444',
+    fontWeight: 'bold',
+  },
+  expenseFooterRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginTop: 8,
+  },
+  viewBillBadge: {
+    backgroundColor: '#EFF6FF',
+    borderRadius: 6,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderWidth: 1,
+    borderColor: '#BFDBFE',
+  },
+  viewBillBadgeText: {
+    fontSize: 11,
+    color: '#1E40AF',
+    fontWeight: 'bold',
+  },
+  modalBackground: {
+    flex: 1,
+    backgroundColor: 'rgba(0, 0, 0, 0.9)',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  modalCloseButton: {
+    position: 'absolute',
+    top: Platform.OS === 'ios' ? 50 : 20,
+    right: 20,
+    backgroundColor: 'rgba(255, 255, 255, 0.3)',
+    borderRadius: 20,
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    zIndex: 10,
+  },
+  modalCloseButtonText: {
+    color: '#FFFFFF',
+    fontSize: 14,
+    fontWeight: 'bold',
+  },
+  modalImageContainer: {
+    width: '100%',
+    height: '80%',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  modalFullImage: {
+    width: '100%',
+    height: '100%',
   },
 });
 

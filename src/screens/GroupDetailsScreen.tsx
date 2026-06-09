@@ -35,6 +35,18 @@ const PASTEL_COLORS = [
   '#D0E1FD', // Pastel Blue
 ];
 
+interface UnifiedTransaction {
+  id: string; // unique string e.g. "contrib_[id]" or "expense_[id]"
+  type: 'contribution' | 'expense';
+  amount: number;
+  description: string;
+  createdAt: string;
+  displayName: string;
+  avatarColor: string;
+  subtext?: string; // e.g. "Chuyến đi: Nha Trang"
+  originalItem: any; // to support deleting contribution if clicked
+}
+
 interface GroupDetailsScreenProps {
   groupId?: number;
   route?: {
@@ -73,6 +85,7 @@ export function GroupDetailsScreen({
   const [members, setMembers] = useState<LocalGroupMember[]>([]);
   const [contributions, setContributions] = useState<LocalContribution[]>([]);
   const [trips, setTrips] = useState<LocalTrip[]>([]);
+  const [transactions, setTransactions] = useState<UnifiedTransaction[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
 
   // Trạng thái modal Thêm thành viên
@@ -108,11 +121,67 @@ export function GroupDetailsScreen({
       const memberList = await db.getGroupMembers(groupId);
       setMembers(memberList);
 
-      // 4. Nếu có quỹ chung, tải lịch sử đóng quỹ
+      // 4. Tải lịch sử đóng quỹ và chi tiêu để ghép thành Lịch sử giao dịch dòng tiền
+      let contribList: LocalContribution[] = [];
       if (fundData) {
-        const contribList = await db.getContributions(fundData.id);
+        contribList = await db.getContributions(fundData.id);
         setContributions(contribList);
       }
+
+      // Tải danh sách hóa đơn chi tiêu của tất cả chuyến đi thuộc nhóm này
+      const expenseRows = await db.getAllAsync<any>(
+        `SELECT 
+          e.id, 
+          e.total_amount, 
+          e.description, 
+          e.created_at, 
+          t.name as tripName,
+          p.display_name as paidByName,
+          p.avatar_color as paidByAvatarColor
+         FROM expenses e
+         JOIN trips t ON e.trip_id = t.id
+         LEFT JOIN profiles p ON e.paid_by = p.id
+         WHERE t.group_id = ?;`,
+        [groupId]
+      );
+
+      const merged: UnifiedTransaction[] = [];
+
+      // Ghép Đóng quỹ (Contributions)
+      contribList.forEach(c => {
+        merged.push({
+          id: `contrib_${c.id}`,
+          type: 'contribution',
+          amount: c.amount,
+          description: 'Nạp tiền vào quỹ chung',
+          createdAt: c.created_at,
+          displayName: c.display_name || 'Thành viên',
+          avatarColor: c.avatar_color || '#3B82F6',
+          originalItem: c,
+        });
+      });
+
+      // Ghép Chi tiêu (Expenses)
+      expenseRows.forEach(e => {
+        merged.push({
+          id: `expense_${e.id}`,
+          type: 'expense',
+          amount: e.total_amount,
+          description: e.description || 'Chi tiêu không tên',
+          createdAt: e.created_at,
+          displayName: e.paidByName || '🏦 Quỹ chung',
+          avatarColor: e.paidByAvatarColor || '#10B981',
+          subtext: `Chuyến đi: ${e.tripName}`,
+          originalItem: e,
+        });
+      });
+
+      // Sắp xếp theo ngày giảm dần (Mới nhất lên đầu)
+      merged.sort((a, b) => {
+        return new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
+      });
+
+      setTransactions(merged);
 
       // 5. Tải danh sách chuyến đi thực tế từ bảng trips
       const tripList = await db.getTripsByGroupId(groupId);
@@ -446,37 +515,59 @@ export function GroupDetailsScreen({
           )}
         </View>
 
-        {/* Lịch sử đóng quỹ */}
+        {/* Lịch sử Giao dịch Dòng tiền */}
         <View style={styles.sectionContainer}>
-          <Text style={styles.sectionTitle}>Lịch sử đóng quỹ</Text>
-          {contributions.length === 0 ? (
+          <Text style={styles.sectionTitle}>📊 Lịch sử giao dịch nhóm (Dòng tiền)</Text>
+          {transactions.length === 0 ? (
             <View style={styles.emptyHistory}>
-              <Text style={styles.emptyText}>Chưa có lượt đóng góp nào.</Text>
+              <Text style={styles.emptyText}>Chưa có giao dịch đóng quỹ hoặc chi tiêu nào.</Text>
             </View>
           ) : (
-            contributions.map((item) => (
-              <View key={item.id} style={styles.contribItem}>
-                <View style={[styles.contribAvatar, { backgroundColor: item.avatar_color || '#E5E7EB' }]}>
-                  <Text style={styles.contribAvatarText}>
-                    {(item.display_name || '?').charAt(0).toUpperCase()}
-                  </Text>
+            transactions.map((item) => {
+              const isContrib = item.type === 'contribution';
+              return (
+                <View key={item.id} style={styles.contribItem}>
+                  <View style={[styles.contribAvatar, { backgroundColor: item.avatarColor }]}>
+                    <Text style={styles.contribAvatarText}>
+                      {isContrib ? item.displayName.charAt(0).toUpperCase() : '💸'}
+                    </Text>
+                  </View>
+                  <View style={styles.contribDetails}>
+                    <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+                      <Text style={styles.contribName}>{item.displayName}</Text>
+                      {!isContrib && (
+                        <View style={styles.expenseBadge}>
+                          <Text style={styles.expenseBadgeText}>Chi tiêu</Text>
+                        </View>
+                      )}
+                    </View>
+                    <Text style={styles.txDescription} numberOfLines={1}>
+                      {isContrib ? item.description : `Chi: ${item.description}`}
+                    </Text>
+                    {item.subtext ? (
+                      <Text style={styles.txSubtext}>{item.subtext}</Text>
+                    ) : null}
+                    <Text style={styles.contribDate}>{item.createdAt}</Text>
+                  </View>
+                  <View style={styles.contribAmountContainer}>
+                    <Text style={[styles.contribAmount, isContrib ? styles.positiveTxAmount : styles.negativeTxAmount]}>
+                      {isContrib ? '+' : '-'}{formatCurrency(item.amount)}
+                    </Text>
+                    {isContrib ? (
+                      <TouchableOpacity
+                        style={styles.deleteContribBtn}
+                        onPress={() => handleDeleteContribution(item.originalItem)}
+                        hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+                      >
+                        <Text style={styles.deleteContribText}>🗑️</Text>
+                      </TouchableOpacity>
+                    ) : (
+                      <View style={{ width: 24 }} />
+                    )}
+                  </View>
                 </View>
-                <View style={styles.contribDetails}>
-                  <Text style={styles.contribName}>{item.display_name}</Text>
-                  <Text style={styles.contribDate}>{item.created_at}</Text>
-                </View>
-                <View style={styles.contribAmountContainer}>
-                  <Text style={styles.contribAmount}>+{formatCurrency(item.amount)}</Text>
-                  <TouchableOpacity
-                    style={styles.deleteContribBtn}
-                    onPress={() => handleDeleteContribution(item)}
-                    hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
-                  >
-                    <Text style={styles.deleteContribText}>🗑️</Text>
-                  </TouchableOpacity>
-                </View>
-              </View>
-            ))
+              );
+            })
           )}
         </View>
       </ScrollView>
@@ -1020,6 +1111,37 @@ const styles = StyleSheet.create({
   },
   deleteContribText: {
     fontSize: 12,
+  },
+  expenseBadge: {
+    backgroundColor: '#EFF6FF',
+    borderRadius: 6,
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    marginLeft: 6,
+    borderWidth: 0.5,
+    borderColor: '#BFDBFE',
+  },
+  expenseBadgeText: {
+    fontSize: 9,
+    color: '#1E40AF',
+    fontWeight: 'bold',
+  },
+  txDescription: {
+    fontSize: 12,
+    color: '#4B5563',
+    marginTop: 2,
+  },
+  txSubtext: {
+    fontSize: 11,
+    color: '#3B82F6',
+    fontWeight: '500',
+    marginTop: 1,
+  },
+  positiveTxAmount: {
+    color: '#10B981',
+  },
+  negativeTxAmount: {
+    color: '#EF4444',
   },
   modalOverlay: {
     flex: 1,

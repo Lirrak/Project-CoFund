@@ -10,7 +10,10 @@
     "test": "jest"
   },
   "dependencies": {
+    "@react-native-ml-kit/text-recognition": "^2.0.0",
     "expo": "~54.0.0",
+    "expo-file-system": "~19.0.23",
+    "expo-image-picker": "~17.0.11",
     "expo-sqlite": "~16.0.10",
     "expo-status-bar": "~3.0.9",
     "react": "19.1.0",
