@@ -1,0 +1,26 @@
+Hướng dẫn build apk trên window powershell
+
+Lỗi này xảy ra do **đường dẫn thư mục của bạn có khoảng trắng** ("Born Again") và có ký tự dư thừa `>` ở cuối. Trong PowerShell, khi đường dẫn có khoảng trắng, bạn bắt buộc phải bọc nó trong dấu nháy kép `""`.
+
+Bạn hãy sao chép và chạy chính xác các dòng lệnh dưới đây trong PowerShell:
+
+### Bước 1: Di chuyển vào thư mục dự án
+Chạy lệnh này để vào đúng thư mục dự án của bạn (đã được bọc trong dấu ngoặc kép):
+```powershell
+cd "C:\Users\Lirrak\Documents\Born Again\Project Shit"
+```
+
+### Bước 2: Di chuyển tiếp vào thư mục `android`
+```powershell
+cd android
+```
+
+### Bước 3: Chạy lệnh build APK
+```powershell
+.\gradlew assembleRelease
+```
+
+*Khi chạy xong, file cài đặt sẽ nằm tại thư mục này trên máy tính của bạn:*
+```text
+C:\Users\Lirrak\Documents\Born Again\Project Shit\android\app\build\outputs\apk\release\app-release.apk
+```

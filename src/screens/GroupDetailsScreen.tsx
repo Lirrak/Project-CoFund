@@ -1,4 +1,5 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
+import { useRealtimeSync } from '../hooks/useRealtimeSync';
 import {
   View,
   Text,
@@ -87,6 +88,20 @@ export function GroupDetailsScreen({
   const [trips, setTrips] = useState<LocalTrip[]>([]);
   const [transactions, setTransactions] = useState<UnifiedTransaction[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
+
+  // Trạng thái Toast Notification nội bộ
+  const [toastVisible, setToastVisible] = useState<boolean>(false);
+  const [toastMessage, setToastMessage] = useState<string>('');
+  const [toastType, setToastType] = useState<string>('');
+
+  const showToast = (message: string, type: string) => {
+    setToastMessage(message);
+    setToastType(type);
+    setToastVisible(true);
+    setTimeout(() => {
+      setToastVisible(false);
+    }, 4000);
+  };
 
   // Trạng thái modal Thêm thành viên
   const [memberModalVisible, setMemberModalVisible] = useState<boolean>(false);
@@ -192,6 +207,14 @@ export function GroupDetailsScreen({
       setLoading(false);
     }
   };
+
+  // Đăng ký realtime sync với Supabase để đồng bộ database SQLite cục bộ
+  useRealtimeSync(groupId, (event) => {
+    loadAllData();
+    if (event.message) {
+      showToast(event.message, event.table);
+    }
+  });
 
   useEffect(() => {
     loadAllData();
@@ -377,9 +400,47 @@ export function GroupDetailsScreen({
 
   if (loading) {
     return (
-      <SafeAreaView style={styles.centered}>
-        <ActivityIndicator size="large" color="#1E3A8A" />
-        <Text style={styles.loadingText}>Đang tải dữ liệu nhóm...</Text>
+      <SafeAreaView style={styles.container}>
+        {/* Header Skeleton */}
+        <View style={[styles.header, { borderBottomWidth: 0 }]}>
+          <View style={{ width: 24, height: 24, borderRadius: 12, backgroundColor: '#3B82F6' }} />
+          <View style={{ flex: 1, marginLeft: 16 }}>
+            <View style={{ width: '50%', height: 18, backgroundColor: '#3B82F6', borderRadius: 4 }} />
+          </View>
+          <View style={{ width: 80, height: 32, borderRadius: 8, backgroundColor: '#EF4444' }} />
+        </View>
+
+        <ScrollView contentContainerStyle={styles.scrollContent}>
+          {/* Card skeleton */}
+          <View style={[styles.balanceCard, { backgroundColor: '#E5E7EB', elevation: 0, shadowOpacity: 0 }]}>
+            <View style={{ width: '40%', height: 14, backgroundColor: '#94A3B8', borderRadius: 4 }} />
+            <View style={{ width: '70%', height: 32, backgroundColor: '#94A3B8', borderRadius: 4, marginVertical: 10 }} />
+            <View style={{ width: '30%', height: 12, backgroundColor: '#94A3B8', borderRadius: 4 }} />
+          </View>
+
+          {/* Actions row skeleton */}
+          <View style={styles.actionRow}>
+            <View style={[styles.actionBtn, { backgroundColor: '#E5E7EB' }]}>
+              <View style={{ width: 30, height: 30, borderRadius: 15, backgroundColor: '#94A3B8' }} />
+              <View style={{ width: '80%', height: 12, backgroundColor: '#94A3B8', borderRadius: 4, marginTop: 8 }} />
+            </View>
+            <View style={[styles.actionBtn, { backgroundColor: '#E5E7EB' }]}>
+              <View style={{ width: 30, height: 30, borderRadius: 15, backgroundColor: '#94A3B8' }} />
+              <View style={{ width: '80%', height: 12, backgroundColor: '#94A3B8', borderRadius: 4, marginTop: 8 }} />
+            </View>
+          </View>
+
+          {/* Sections skeletons */}
+          <View style={{ marginTop: 24, paddingHorizontal: 16 }}>
+            <View style={{ width: '30%', height: 18, backgroundColor: '#E5E7EB', borderRadius: 4, marginBottom: 12 }} />
+            {[1, 2].map((i) => (
+              <View key={i} style={{ height: 60, backgroundColor: '#E5E7EB', borderRadius: 12, marginVertical: 6, padding: 12, justifyContent: 'center' }}>
+                <View style={{ width: '60%', height: 12, backgroundColor: '#94A3B8', borderRadius: 4 }} />
+                <View style={{ width: '30%', height: 10, backgroundColor: '#94A3B8', borderRadius: 4, marginTop: 6 }} />
+              </View>
+            ))}
+          </View>
+        </ScrollView>
       </SafeAreaView>
     );
   }
@@ -503,11 +564,11 @@ export function GroupDetailsScreen({
                 >
                   <View style={[styles.memberAvatar, { backgroundColor: member.avatar_color }]}>
                     <Text style={styles.memberAvatarText}>
-                      {member.display_name.charAt(0).toUpperCase()}
+                      {(member.display_name || 'Thành viên').charAt(0).toUpperCase()}
                     </Text>
                   </View>
                   <Text style={styles.memberName} numberOfLines={1}>
-                    {member.display_name}
+                    {member.display_name || 'Thành viên'}
                   </Text>
                 </TouchableOpacity>
               ))}
@@ -527,14 +588,14 @@ export function GroupDetailsScreen({
               const isContrib = item.type === 'contribution';
               return (
                 <View key={item.id} style={styles.contribItem}>
-                  <View style={[styles.contribAvatar, { backgroundColor: item.avatarColor }]}>
+                   <View style={[styles.contribAvatar, { backgroundColor: item.avatarColor }]}>
                     <Text style={styles.contribAvatarText}>
-                      {isContrib ? item.displayName.charAt(0).toUpperCase() : '💸'}
+                      {isContrib ? (item.displayName || 'Thành viên').charAt(0).toUpperCase() : '💸'}
                     </Text>
                   </View>
                   <View style={styles.contribDetails}>
                     <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-                      <Text style={styles.contribName}>{item.displayName}</Text>
+                      <Text style={styles.contribName}>{item.displayName || 'Thành viên'}</Text>
                       {!isContrib && (
                         <View style={styles.expenseBadge}>
                           <Text style={styles.expenseBadgeText}>Chi tiêu</Text>
@@ -580,7 +641,7 @@ export function GroupDetailsScreen({
         onRequestClose={() => setMemberModalVisible(false)}
       >
         <KeyboardAvoidingView
-          behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+          behavior={Platform.OS === 'ios' ? 'padding' : 'padding'}
           style={styles.modalOverlay}
         >
           <View style={styles.modalContent}>
@@ -633,7 +694,7 @@ export function GroupDetailsScreen({
         }}
       >
         <KeyboardAvoidingView
-          behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+          behavior={Platform.OS === 'ios' ? 'padding' : 'padding'}
           style={styles.modalOverlay}
         >
           <View style={styles.modalContent}>
@@ -659,7 +720,7 @@ export function GroupDetailsScreen({
                   >
                     <View style={[styles.memberAvatar, { backgroundColor: member.avatar_color, width: 40, height: 40, borderRadius: 20 }]}>
                       <Text style={styles.memberAvatarText}>
-                        {member.display_name.charAt(0).toUpperCase()}
+                        {(member.display_name || 'Thành viên').charAt(0).toUpperCase()}
                       </Text>
                     </View>
                     <Text
@@ -669,7 +730,7 @@ export function GroupDetailsScreen({
                       ]}
                       numberOfLines={1}
                     >
-                      {member.display_name}
+                      {member.display_name || 'Thành viên'}
                     </Text>
                   </TouchableOpacity>
                 );
@@ -732,7 +793,7 @@ export function GroupDetailsScreen({
         }}
       >
         <KeyboardAvoidingView
-          behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+          behavior={Platform.OS === 'ios' ? 'padding' : 'padding'}
           style={styles.modalOverlay}
         >
           <View style={styles.modalContent}>
@@ -772,6 +833,19 @@ export function GroupDetailsScreen({
           </View>
         </KeyboardAvoidingView>
       </Modal>
+
+      {/* Toast Notification nội bộ */}
+      {toastVisible && (
+        <View style={styles.toastContainer}>
+          <View style={styles.toastCard}>
+            <View style={styles.toastHeaderRow}>
+              <Text style={styles.toastTitle}>🔔 Đồng bộ Realtime</Text>
+              <Text style={styles.toastTime}>Vừa xong</Text>
+            </View>
+            <Text style={styles.toastText}>{toastMessage}</Text>
+          </View>
+        </View>
+      )}
     </SafeAreaView>
   );
 }
@@ -1235,5 +1309,44 @@ const styles = StyleSheet.create({
   confirmButton: {
     backgroundColor: '#1E3A8A',
     marginLeft: 8,
+  },
+  toastContainer: {
+    position: 'absolute',
+    top: Platform.OS === 'ios' ? 50 : 30,
+    left: 16,
+    right: 16,
+    zIndex: 9999,
+  },
+  toastCard: {
+    backgroundColor: '#1E293B',
+    borderRadius: 12,
+    padding: 14,
+    shadowColor: '#000000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.15,
+    shadowRadius: 12,
+    elevation: 8,
+    borderLeftWidth: 4,
+    borderLeftColor: '#10B981',
+  },
+  toastHeaderRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 4,
+  },
+  toastTitle: {
+    fontSize: 13,
+    fontWeight: 'bold',
+    color: '#34D399',
+  },
+  toastTime: {
+    fontSize: 10,
+    color: '#94A3B8',
+  },
+  toastText: {
+    fontSize: 13,
+    color: '#F8FAFC',
+    fontWeight: '500',
   },
 });

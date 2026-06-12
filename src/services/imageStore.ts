@@ -1,15 +1,14 @@
-import * as FileSystem from 'expo-file-system/legacy';
+import { Paths, Directory, File } from 'expo-file-system';
 
-const BILLS_DIR = `${FileSystem.documentDirectory}bills/`;
+const billsDir = new Directory(Paths.document, 'bills');
 
 /**
  * Đảm bảo thư mục lưu trữ hóa đơn tồn tại trong hệ thống tệp tin cục bộ.
  */
 export async function ensureDirectoryExists(): Promise<void> {
   try {
-    const dirInfo = await FileSystem.getInfoAsync(BILLS_DIR);
-    if (!dirInfo.exists) {
-      await FileSystem.makeDirectoryAsync(BILLS_DIR, { intermediates: true });
+    if (!billsDir.exists) {
+      billsDir.create({ intermediates: true, idempotent: true });
     }
   } catch (error) {
     console.error('Error ensuring directory exists:', error);
@@ -47,16 +46,15 @@ export async function saveBillImageLocally(tempUri: string): Promise<string> {
 
     const uuid = generateUUID();
     const fileName = `bill_${uuid}.jpg`;
-    const newUri = `${BILLS_DIR}${fileName}`;
+    
+    const sourceFile = new File(tempUri);
+    const destinationFile = new File(billsDir, fileName);
 
     // Sao chép tệp tin
-    await FileSystem.copyAsync({
-      from: tempUri,
-      to: newUri,
-    });
+    sourceFile.copy(destinationFile);
 
-    console.log(`Saved bill image locally: ${newUri}`);
-    return newUri;
+    console.log(`Saved bill image locally: ${destinationFile.uri}`);
+    return destinationFile.uri;
   } catch (error) {
     console.error('Failed to save bill image locally:', error);
     throw new Error('Lỗi trong quá trình lưu trữ ảnh hóa đơn cục bộ.');

@@ -572,6 +572,41 @@ export class LocalDB {
   }
 
   /**
+   * Ghi nhận nhiều đóng góp/rút quỹ để quyết toán toàn bộ số dư ròng về 0đ.
+   * Phương thức này chấp nhận cả số tiền âm cho giao dịch rút quỹ/hoàn trả.
+   * @param fundId ID của quỹ nhóm cần cân bằng
+   * @param contributions Mảng chứa các giao dịch của các thành viên (âm là rút, dương là nạp)
+   * @returns true nếu lưu thành công, false nếu lỗi
+   */
+  public async addSettlementContributions(
+    fundId: number,
+    contributions: { userId: number; amount: number }[]
+  ): Promise<boolean> {
+    try {
+      const db = await this.getDb();
+      await db.withTransactionAsync(async () => {
+        for (const item of contributions) {
+          // 1. Chèn bản ghi đóng/rút quỹ
+          await db.runAsync(
+            'INSERT INTO contributions (fund_id, user_id, amount) VALUES (?, ?, ?);',
+            [fundId, item.userId, item.amount]
+          );
+
+          // 2. Cập nhật cộng/trừ trực tiếp vào số dư của quỹ tương ứng
+          await db.runAsync(
+            'UPDATE funds SET balance = balance + ? WHERE id = ?;',
+            [item.amount, fundId]
+          );
+        }
+      });
+      return true;
+    } catch (error) {
+      console.error('Error in addSettlementContributions:', error);
+      return false;
+    }
+  }
+
+  /**
    * Lưu hoặc cập nhật cấu hình cài đặt dưới dạng Key-Value bền vững trong SQLite.
    */
   public async saveSetting(key: string, value: string): Promise<boolean> {

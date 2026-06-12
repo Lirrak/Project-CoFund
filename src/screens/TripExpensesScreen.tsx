@@ -1,4 +1,6 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
+import { useRealtimeSync } from '../hooks/useRealtimeSync';
+import { BeautifulPieChart } from '../components/BeautifulPieChart';
 import {
   View,
   Text,
@@ -13,6 +15,8 @@ import {
   StatusBar,
   Image,
   Modal,
+  Pressable,
+  Dimensions,
 } from 'react-native';
 import { LocalDB, LocalGroupMember } from '../services/sqlite';
 import {
@@ -27,7 +31,8 @@ import {
 import { saveBillImageLocally } from '../services/imageStore';
 import { OCRParser } from '../services/ocrParser';
 import * as ImagePicker from 'expo-image-picker';
-import * as FileSystem from 'expo-file-system/legacy';
+import { Paths, File } from 'expo-file-system';
+import * as Sharing from 'expo-sharing';
 
 interface TripExpensesScreenProps {
   tripId: number;
@@ -50,19 +55,58 @@ interface DisplayExpense {
   }>;
 }
 
-const MODEL_DIR = `${FileSystem.documentDirectory}models/`;
-const MODEL_PATH = `${MODEL_DIR}qwen-1.5b.gguf`;
-const DEFAULT_MODEL_URL = 'https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf';
+const MEMBER_COLORS = [
+  '#3B82F6', // Xanh Dương
+  '#10B981', // Xanh Lá
+  '#F59E0B', // Vàng Hổ Phách
+  '#EF4444', // Đỏ
+  '#8B5CF6', // Tím
+  '#EC4899', // Hồng
+  '#14B8A6', // Xanh Ngọc
+  '#F97316', // Cam
+];
 
 function TripExpensesScreenContent({ tripId, tripName, groupId, onGoBack }: TripExpensesScreenProps) {
   const [loading, setLoading] = useState<boolean>(true);
   const [activeTab, setActiveTab] = useState<'balances' | 'expenses' | 'add' | 'settlement'>('balances');
+
+  // Trạng thái Toast Notification nội bộ
+  const [toastVisible, setToastVisible] = useState<boolean>(false);
+  const [toastMessage, setToastMessage] = useState<string>('');
+  const [toastType, setToastType] = useState<string>('');
+
+  // Trạng thái Modal chi tiết hóa đơn và phân rã splits
+  const [selectedExpense, setSelectedExpense] = useState<DisplayExpense | null>(null);
+  const [expenseModalVisible, setExpenseModalVisible] = useState<boolean>(false);
+
+  const showToast = (message: string, type: string) => {
+    setToastMessage(message);
+    setToastType(type);
+    setToastVisible(true);
+    setTimeout(() => {
+      setToastVisible(false);
+    }, 4000);
+  };
+
+  // Đăng ký realtime sync kết nối Supabase WebSockets
+  useRealtimeSync(groupId, (event) => {
+    // Tải lại dữ liệu từ SQLite cục bộ tức thì khi nhận được sự kiện
+    loadData();
+    if (event.message) {
+      showToast(event.message, event.table);
+    }
+  });
 
   // Dữ liệu từ DB
   const [memberStates, setMemberStates] = useState<MemberState[]>([]);
   const [members, setMembers] = useState<LocalGroupMember[]>([]);
   const [expenses, setExpenses] = useState<DisplayExpense[]>([]);
   const [fundBalance, setFundBalance] = useState<number>(0);
+
+  // Trạng thái quyết toán & Chú thích popup
+  const [isSettlementActive, setIsSettlementActive] = useState<boolean>(false);
+  const [showAboutSettlementModal, setShowAboutSettlementModal] = useState<boolean>(false);
+  const [isCompletingSettlement, setIsCompletingSettlement] = useState<boolean>(false);
 
   // Form thêm chi tiêu mới
   const [amount, setAmount] = useState<string>('');
@@ -73,42 +117,16 @@ function TripExpensesScreenContent({ tripId, tripName, groupId, onGoBack }: Trip
   const [memberPercents, setMemberPercents] = useState<Record<number, string>>({}); // Lưu trữ % tùy chọn
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
 
-  // Cấu hình OCR AI & Local LLM
+  // Trạng thái OCR AI & Giao diện ảnh
   const [billImageUri, setBillImageUri] = useState<string | null>(null);
   const [ocrLoading, setOcrLoading] = useState<boolean>(false);
-  const [aiMode, setAiMode] = useState<'heuristics' | 'llamacpp' | 'ondevice_llm'>('heuristics');
-  const [llamaServerUrl, setLlamaServerUrl] = useState<string>('http://192.168.1.50:8080');
-  const [showAiSettings, setShowAiSettings] = useState<boolean>(false);
   const [previewImageUri, setPreviewImageUri] = useState<string | null>(null);
-
-  // Trạng thái tải mô hình AI On-Device (.gguf)
-  const [isDownloadingModel, setIsDownloadingModel] = useState<boolean>(false);
-  const [modelDownloadProgress, setModelDownloadProgress] = useState<number>(0);
-  const [isModelReady, setIsModelReady] = useState<boolean>(false);
 
   // Tải toàn bộ dữ liệu liên quan
   const loadData = async () => {
     try {
       setLoading(true);
       const db = LocalDB.getInstance();
-
-      // 0. Tải cấu hình cài đặt AI từ SQLite
-      try {
-        const savedAiMode = await db.getSetting('ai_mode');
-        if (savedAiMode === 'heuristics' || savedAiMode === 'llamacpp' || savedAiMode === 'ondevice_llm') {
-          setAiMode(savedAiMode);
-        }
-        const savedLlamaUrl = await db.getSetting('llama_server_url');
-        if (savedLlamaUrl) {
-          setLlamaServerUrl(savedLlamaUrl);
-        }
-
-        // Kiểm tra xem mô hình AI On-Device đã được tải về máy chưa
-        const modelInfo = await FileSystem.getInfoAsync(MODEL_PATH);
-        setIsModelReady(modelInfo.exists);
-      } catch (err) {
-        console.warn('Could not read settings, maybe tables are initializing...', err);
-      }
 
       // 1. Tính toán số dư ròng (Net Balance) của các thành viên trong nhóm
       const states = await calculateMemberNetBalances(groupId);
@@ -247,157 +265,7 @@ function TripExpensesScreenContent({ tripId, tripName, groupId, onGoBack }: Trip
     }
   };
 
-  // Lưu cài đặt AI bền vững vào SQLite
-  const saveAiSetting = async (key: string, value: string) => {
-    const db = LocalDB.getInstance();
-    await db.saveSetting(key, value);
-  };
 
-  // Hàm gọi API tới Local Llama.cpp Server để phân tích văn bản hóa đơn
-  const parseAmountWithLlamaCpp = async (ocrLines: string[]): Promise<number | null> => {
-    const fullText = ocrLines.join('\n');
-    const prompt = `Bạn là trợ lý AI chuyên nghiệp phân tích hóa đơn tiếng Việt. 
-Hãy đọc dữ liệu văn bản bóc tách từ hóa đơn dưới đây, tìm ra số tiền tổng cộng (Total Amount) cần thanh toán.
-Yêu cầu bắt buộc: Trả về duy nhất một chuỗi JSON có định dạng: {"total_amount": số_tiền_chuyển_đổi_thành_số_nguyên}. Không giải thích gì thêm ngoài JSON.
-
-Dữ liệu hóa đơn OCR:
-"""
-${fullText}
-"""`;
-
-    try {
-      const response = await fetch(`${llamaServerUrl}/v1/chat/completions`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: "qwen",
-          messages: [{ role: "user", content: prompt }],
-          temperature: 0.1,
-        }),
-      });
-
-      const data = await response.json();
-      const reply = data.choices[0].message.content.trim();
-      
-      // Tìm và trích xuất JSON từ câu trả lời của LLM
-      const jsonMatch = reply.match(/\{.*\}/s);
-      if (jsonMatch) {
-        const parsed = JSON.parse(jsonMatch[0]);
-        return parsed.total_amount || null;
-      }
-      return null;
-    } catch (error) {
-      console.error('Lỗi kết nối tới local llama.cpp server:', error);
-      Alert.alert(
-        'Lỗi kết nối AI', 
-        'Không thể kết nối tới máy chủ Llama.cpp nội bộ. Vui lòng kiểm tra địa chỉ IP hoặc chuyển sang chế độ Heuristics Offline.'
-      );
-      return null;
-    }
-  };
-
-  // Hàm tải mô hình GGUF từ URL về thư mục cục bộ của ứng dụng
-  const handleDownloadModel = async () => {
-    try {
-      setIsDownloadingModel(true);
-      setModelDownloadProgress(0);
-
-      // Đảm bảo thư mục models/ tồn tại
-      const dirInfo = await FileSystem.getInfoAsync(MODEL_DIR);
-      if (!dirInfo.exists) {
-        await FileSystem.makeDirectoryAsync(MODEL_DIR, { intermediates: true });
-      }
-
-      // Thiết lập download resumable kèm callback cập nhật tiến trình %
-      const callback = (downloadProgress: any) => {
-        const progress = downloadProgress.totalBytesWritten / downloadProgress.totalBytesExpectedToWrite;
-        setModelDownloadProgress(Math.round(progress * 100));
-      };
-
-      const downloadResumable = FileSystem.createDownloadResumable(
-        DEFAULT_MODEL_URL,
-        MODEL_PATH,
-        {},
-        callback
-      );
-
-      const result = await downloadResumable.downloadAsync();
-      if (result && result.uri) {
-        setIsModelReady(true);
-        Alert.alert(
-          'Tải mô hình thành công! 🎉',
-          'Mô hình AI Qwen (1.5B) đã được lưu thành công trên thiết bị của bạn. Bạn đã sẵn sàng sử dụng trí tuệ nhân tạo offline 100%!'
-        );
-      }
-    } catch (error: any) {
-      console.error('Error downloading model:', error);
-      Alert.alert('Lỗi tải mô hình', error?.message || 'Có lỗi xảy ra trong quá trình tải mô hình AI.');
-    } finally {
-      setIsDownloadingModel(false);
-    }
-  };
-
-  // Gọi mô hình AI Llama.cpp trực tiếp TRÊN ĐIỆN THOẠI (On-Device Inference)
-  const parseAmountWithOnDeviceLlama = async (ocrLines: string[]): Promise<number | null> => {
-    const fullText = ocrLines.join('\n');
-    const prompt = `Bạn là trợ lý AI chuyên nghiệp phân tích hóa đơn tiếng Việt. 
-Hãy đọc dữ liệu văn bản bóc tách từ hóa đơn dưới đây, tìm ra số tiền tổng cộng (Total Amount) cần thanh toán.
-Yêu cầu bắt buộc: Trả về duy nhất một chuỗi JSON có định dạng: {"total_amount": số_tiền_chuyển_đổi_thành_số_nguyên}. Không giải thích gì thêm ngoài JSON.
-
-Dữ liệu hóa đơn OCR:
-"""
-${fullText}
-"""`;
-
-    // 1. Kiểm tra xem thư viện native react-native-llama có sẵn và hoạt động không
-    let isLlamaLinked = false;
-    try {
-      // Thử load động thư viện native để tránh lỗi biên dịch trên môi trường Expo Go
-      const LlamaModule = require('react-native-llama');
-      if (LlamaModule && LlamaModule.initLlama) {
-        isLlamaLinked = true;
-      }
-    } catch (e) {
-      console.warn('react-native-llama is not linked in this build.');
-    }
-
-    if (!isLlamaLinked) {
-      // Nếu không có native linking (chạy trong Expo Go hoặc chưa rebuilt), ném một lỗi cụ thể để kích hoạt Trình giả lập On-Device
-      throw new Error("unlinked: Thư viện native 'react-native-llama' chưa được tích hợp vào build này.");
-    }
-
-    // 2. Chạy suy luận native on-device thực tế qua react-native-llama
-    try {
-      const LlamaModule = require('react-native-llama');
-      
-      console.log('Initializing on-device llama context from:', MODEL_PATH);
-      const context = await LlamaModule.initLlama({
-        model: MODEL_PATH,
-        use_mlock: true,
-        n_ctx: 1024,
-      });
-
-      console.log('Running on-device LLM inference...');
-      const response = await context.completion({
-        prompt: prompt,
-        temperature: 0.1,
-      });
-
-      const reply = response.text.trim();
-      console.log('On-device LLM reply:', reply);
-
-      // Tìm và giải mã JSON
-      const jsonMatch = reply.match(/\{.*\}/s);
-      if (jsonMatch) {
-        const parsed = JSON.parse(jsonMatch[0]);
-        return parsed.total_amount || null;
-      }
-      return null;
-    } catch (error) {
-      console.error('Error in on-device llama inference:', error);
-      throw error;
-    }
-  };
 
   // Xử lý luồng chạy OCR offline & bóc tách số tiền
   const handleProcessImage = async (tempUri: string) => {
@@ -418,25 +286,8 @@ ${fullText}
 
       console.log('Detected OCR lines:', lines);
 
-      // 3. Phân tích bóc tách số tiền dựa trên cấu hình AI Mode
-      let detectedAmount: number | null = null;
-      if (aiMode === 'heuristics') {
-        // Chế độ 1: Dùng Heuristics offline nhanh <1s
-        detectedAmount = OCRParser.extractBillAmount(lines);
-      } else if (aiMode === 'llamacpp') {
-        // Chế độ 2: Dùng Llama.cpp Local Server
-        detectedAmount = await parseAmountWithLlamaCpp(lines);
-      } else if (aiMode === 'ondevice_llm') {
-        // Chế độ 3: Chạy Llama.cpp trực tiếp trên điện thoại!
-        if (!isModelReady) {
-          Alert.alert(
-            'Chưa tải mô hình AI 📥',
-            'Bạn cần tải mô hình AI Qwen (1.5B) về điện thoại trước khi sử dụng chế độ On-Device LLM.\n\nVui lòng vào phần Cài đặt AI của biểu mẫu hóa đơn và bấm nút "Tải mô hình AI On-Device".'
-          );
-          return;
-        }
-        detectedAmount = await parseAmountWithOnDeviceLlama(lines);
-      }
+      // 3. Phân tích bóc tách số tiền bằng Heuristics offline nhanh <1s
+      const detectedAmount = OCRParser.extractBillAmount(lines);
 
       // 4. Cập nhật kết quả vào form nhập liệu nếu tìm thấy số tiền hợp lệ
       if (detectedAmount && detectedAmount > 0) {
@@ -674,6 +525,69 @@ ${fullText}
     }
   };
 
+  // Hàm tạo dữ liệu CSV từ danh sách chi tiêu
+  const generateCSVContent = (expensesList: DisplayExpense[]): string => {
+    const BOM = '\uFEFF';
+    const headers = ['Ngày', 'Người thanh toán', 'Mô tả', 'Tổng tiền (đ)', 'Chi tiết phân chia gánh nợ'];
+    
+    const escapeCSV = (val: string) => {
+      const escaped = val.replace(/"/g, '""');
+      return `"${escaped}"`;
+    };
+
+    const rows = expensesList.map(exp => {
+      const date = exp.created_at;
+      const payer = exp.paidByName;
+      const desc = exp.description;
+      const amount = exp.total_amount.toString();
+      const splitDetail = exp.splits
+        .map(s => `${s.displayName}: ${Math.round(s.calculatedAmount).toLocaleString('vi-VN')}đ (${(s.ratio * 100).toFixed(1)}%)`)
+        .join('; ');
+
+      return [
+        escapeCSV(date),
+        escapeCSV(payer),
+        escapeCSV(desc),
+        amount,
+        escapeCSV(splitDetail)
+      ].join(',');
+    });
+
+    return BOM + [headers.join(','), ...rows].join('\n');
+  };
+
+  // Hàm xử lý xuất file CSV và chia sẻ qua Sharing API
+  const handleExportCSV = async () => {
+    if (expenses.length === 0) {
+      Alert.alert('Thông báo', 'Không có dữ liệu chi tiêu để xuất.');
+      return;
+    }
+
+    try {
+      const csvContent = generateCSVContent(expenses);
+      const sanitizedTripName = tripName.replace(/[^a-zA-Z0-9_]/g, '_').replace(/_+/g, '_');
+      const fileName = `CoFund_ChiTieu_${sanitizedTripName}.csv`;
+      
+      const file = new File(Paths.cache, fileName);
+      file.write(csvContent, { encoding: 'utf8' });
+      const fileUri = file.uri;
+
+      const isSharingAvailable = await Sharing.isAvailableAsync();
+      if (isSharingAvailable) {
+        await Sharing.shareAsync(fileUri, {
+          mimeType: 'text/csv',
+          dialogTitle: `Xuất lịch sử chi tiêu: ${tripName}`,
+          UTI: 'public.comma-separated-values-text', // iOS
+        });
+      } else {
+        Alert.alert('Lỗi', 'Thiết bị của bạn không hỗ trợ chia sẻ tệp tin.');
+      }
+    } catch (error) {
+      console.error('Failed to export CSV:', error);
+      Alert.alert('Lỗi', 'Không thể xuất hoặc chia sẻ tệp CSV.');
+    }
+  };
+
   // Toggle thành viên gánh hóa đơn
   const toggleSelectMember = (userId: number) => {
     if (selectedMemberIds.includes(userId)) {
@@ -695,19 +609,172 @@ ${fullText}
     });
   };
 
-  // Tính toán báo cáo tinh giản nợ
-  const debtTransactions = splitCalculator.simplifyDebts(memberStates);
-
   // Định dạng tiền VNĐ hiển thị
   const formatVND = (value: number) => {
     return Math.round(value).toLocaleString('vi-VN') + ' đ';
   };
 
+  // Tính toán báo cáo tinh giản nợ, tích hợp Quỹ chung làm thực thể ảo nếu số dư khác 0
+  const getExtendedMemberStates = () => {
+    const extended = [...memberStates];
+    if (Math.abs(fundBalance) > 0.1) {
+      extended.push({
+        userId: -999, // ID đặc biệt cho Quỹ chung
+        displayName: 'Quỹ chung',
+        totalContributed: 0,
+        totalPaidOutOfPocket: 0,
+        totalSpent: 0,
+        netBalance: -fundBalance, // Nếu Quỹ chung âm, ảo netBalance dương => Chủ nợ; ngược lại => Con nợ
+      });
+    }
+    return extended;
+  };
+
+  const debtTransactions = splitCalculator.simplifyDebts(getExtendedMemberStates());
+
+  // Render từng dòng giao dịch thanh toán quyết toán
+  const renderTransactionItem = (tx: DebtTransaction, idx: number) => {
+    const isFromFund = tx.fromUserId === -999;
+    const isToFund = tx.toUserId === -999;
+
+    return (
+      <View key={idx} style={styles.transactionItem}>
+        <View style={styles.txLine}>
+          {isFromFund ? (
+            <>
+              <Text style={styles.txFromName}>🏦 Quỹ chung</Text>
+              <Text style={[styles.txArrow, { color: '#EAB308', fontWeight: 'bold' }]}> 📥 Rút / Hoàn trả</Text>
+              <Text style={styles.txAmount}> {formatVND(tx.amount)}</Text>
+              <Text style={styles.txArrow}> cho </Text>
+              <Text style={styles.txToName}>{tx.toDisplayName}</Text>
+            </>
+          ) : isToFund ? (
+            <>
+              <Text style={styles.txFromName}>{tx.fromDisplayName}</Text>
+              <Text style={[styles.txArrow, { color: '#10B981', fontWeight: 'bold' }]}> 📤 Nộp tiền vào</Text>
+              <Text style={styles.txToName}> 🏦 Quỹ chung</Text>
+              <Text style={styles.txAmount}> {formatVND(tx.amount)}</Text>
+            </>
+          ) : (
+            <>
+              <Text style={styles.txFromName}>{tx.fromDisplayName}</Text>
+              <Text style={styles.txArrow}> 👉 chuyển khoản </Text>
+              <Text style={styles.txAmount}>{formatVND(tx.amount)}</Text>
+              <Text style={styles.txArrow}> cho </Text>
+              <Text style={styles.txToName}>{tx.toDisplayName}</Text>
+            </>
+          )}
+        </View>
+      </View>
+    );
+  };
+
+  // Hoàn tất quyết toán và cập nhật số dư thực tế trong DB
+  const handleCompleteSettlement = async () => {
+    Alert.alert(
+      'Xác nhận Hoàn tất Quyết toán',
+      'Hệ thống sẽ ghi nhận các giao dịch cấn trừ này vào lịch sử đóng quỹ, giúp đưa số dư ròng của tất cả thành viên và số dư Quỹ chung về đúng 0 đ sòng phẳng. Bạn có chắc chắn muốn hoàn tất?',
+      [
+        { text: 'Hủy', style: 'cancel' },
+        {
+          text: 'Đồng ý',
+          style: 'default',
+          onPress: async () => {
+            setIsCompletingSettlement(true);
+            try {
+              const db = LocalDB.getInstance();
+              
+              // Lấy fundId của nhóm
+              const fund = await db.getFundByGroupId(groupId);
+              if (!fund) {
+                Alert.alert('Lỗi', 'Không tìm thấy quỹ của nhóm.');
+                return;
+              }
+
+              // Chuẩn bị danh sách đóng góp cấn trừ để nạp/rút quỹ
+              const settlementContributions = memberStates
+                .filter(m => Math.abs(m.netBalance) > 0.1)
+                .map(m => ({
+                  userId: m.userId,
+                  amount: -m.netBalance,
+                }));
+
+              if (settlementContributions.length > 0) {
+                const success = await db.addSettlementContributions(fund.id, settlementContributions);
+                if (success) {
+                  Alert.alert('Thành công', 'Đã ghi nhận các giao dịch quyết toán và đưa số dư ròng cả nhóm về 0đ sòng phẳng!');
+                  setIsSettlementActive(false);
+                  await loadData(); // Làm mới dữ liệu hiển thị
+                } else {
+                  Alert.alert('Lỗi', 'Không thể lưu các giao dịch quyết toán vào cơ sở dữ liệu.');
+                }
+              } else {
+                Alert.alert('Thông tin', 'Số dư cả nhóm hiện tại đã sòng phẳng 0đ rồi.');
+              }
+            } catch (err) {
+              console.error('Error completing settlement:', err);
+              Alert.alert('Lỗi', 'Có lỗi xảy ra trong quá trình hoàn tất quyết toán.');
+            } finally {
+              setIsCompletingSettlement(false);
+            }
+          },
+        },
+      ]
+    );
+  };
+
   if (loading && memberStates.length === 0) {
     return (
-      <SafeAreaView style={styles.centered}>
-        <ActivityIndicator size="large" color="#1E3A8A" />
-        <Text style={styles.loadingText}>Đang xử lý dữ liệu quỹ và chi tiêu...</Text>
+      <SafeAreaView style={styles.container}>
+        {/* Header Skeleton */}
+        <View style={styles.header}>
+          <View style={{ width: 24, height: 24, borderRadius: 12, backgroundColor: '#3B82F6' }} />
+          <View style={{ flex: 1, marginLeft: 16 }}>
+            <View style={{ width: '60%', height: 18, backgroundColor: '#3B82F6', borderRadius: 4 }} />
+            <View style={{ width: '40%', height: 12, backgroundColor: '#60A5FA', borderRadius: 4, marginTop: 4 }} />
+          </View>
+        </View>
+
+        {/* TabBar Skeleton */}
+        <View style={styles.tabBar}>
+          {[1, 2, 3, 4].map((i) => (
+            <View key={i} style={{ flex: 1, paddingVertical: 14, alignItems: 'center' }}>
+              <View style={{ width: '70%', height: 12, backgroundColor: '#E5E7EB', borderRadius: 4 }} />
+            </View>
+          ))}
+        </View>
+
+        <ScrollView style={styles.content}>
+          <View style={styles.tabContent}>
+            {/* Chart Skeleton */}
+            <View style={{ backgroundColor: '#FFFFFF', borderRadius: 16, padding: 16, marginVertical: 12 }}>
+              <View style={{ width: '50%', height: 14, backgroundColor: '#E5E7EB', borderRadius: 4, marginBottom: 16 }} />
+              <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+                <View style={{ width: 100, height: 100, borderRadius: 50, backgroundColor: '#E5E7EB' }} />
+                <View style={{ flex: 1, marginLeft: 24 }}>
+                  <View style={{ width: '80%', height: 12, backgroundColor: '#E5E7EB', borderRadius: 4, marginVertical: 4 }} />
+                  <View style={{ width: '60%', height: 12, backgroundColor: '#E5E7EB', borderRadius: 4, marginVertical: 4 }} />
+                  <View style={{ width: '70%', height: 12, backgroundColor: '#E5E7EB', borderRadius: 4, marginVertical: 4 }} />
+                </View>
+              </View>
+            </View>
+
+            {/* List Skeleton */}
+            <View style={{ backgroundColor: '#FFFFFF', borderRadius: 16, padding: 16, marginVertical: 12 }}>
+              <View style={{ width: '70%', height: 14, backgroundColor: '#E5E7EB', borderRadius: 4, marginBottom: 16 }} />
+              {[1, 2, 3].map((i) => (
+                <View key={i} style={{ flexDirection: 'row', alignItems: 'center', marginVertical: 12 }}>
+                  <View style={{ width: 40, height: 40, borderRadius: 20, backgroundColor: '#E5E7EB' }} />
+                  <View style={{ flex: 1, marginLeft: 12 }}>
+                    <View style={{ width: '40%', height: 12, backgroundColor: '#E5E7EB', borderRadius: 4 }} />
+                    <View style={{ width: '70%', height: 10, backgroundColor: '#F3F4F6', borderRadius: 4, marginTop: 4 }} />
+                  </View>
+                  <View style={{ width: 60, height: 12, backgroundColor: '#E5E7EB', borderRadius: 4 }} />
+                </View>
+              ))}
+            </View>
+          </View>
+        </ScrollView>
       </SafeAreaView>
     );
   }
@@ -760,95 +827,189 @@ ${fullText}
 
       <ScrollView style={styles.content}>
         {/* TAB 1: SỐ DƯ RÒNG CỦA TỪNG THÀNH VIÊN */}
-        {activeTab === 'balances' && (
-          <View style={styles.tabContent}>
-            <View style={styles.card}>
-              <Text style={styles.cardTitle}>📊 Bảng cân đối Số dư Ròng (Net Balance)</Text>
-              <Text style={styles.cardDesc}>
-                Số tiền thực tế mỗi người được nhận lại (+) hoặc cần phải nộp thêm (-) để đưa toàn bộ chuyến đi về trạng thái cân bằng.
-                {'\n'}
-                <Text style={styles.boldText}>Net Balance = (Nạp quỹ) + (Tự ứng) - (Tiền gánh splits)</Text>
-              </Text>
+        {activeTab === 'balances' && (() => {
+          const totalTripSpent = memberStates.reduce((sum, m) => sum + m.totalSpent, 0);
+          const pieChartData = memberStates.map((m, idx) => ({
+            id: m.userId,
+            label: m.displayName,
+            value: m.totalContributed,
+            color: MEMBER_COLORS[idx % MEMBER_COLORS.length],
+          }));
 
-              {memberStates.map(m => (
-                <View key={m.userId} style={styles.balanceItem}>
-                  <View style={styles.memberInfo}>
-                    <View style={styles.avatar}>
-                      <Text style={styles.avatarText}>{m.displayName.charAt(0).toUpperCase()}</Text>
-                    </View>
-                    <View style={{ flex: 1 }}>
-                      <Text style={styles.memberName}>{m.displayName}</Text>
-                      <Text style={styles.memberContribution}>
-                        Nạp quỹ: {formatVND(m.totalContributed)} | Ứng túi: {formatVND(m.totalPaidOutOfPocket)}
-                      </Text>
-                      <Text style={styles.memberContribution}>
-                        Tiền gánh splits: {formatVND(m.totalSpent)}
-                      </Text>
-                    </View>
-                  </View>
-                  <View style={styles.balanceRight}>
-                    <Text style={[styles.memberBalance, m.netBalance >= 0 ? styles.positiveText : styles.negativeText]}>
-                      {m.netBalance >= 0 ? '+' : ''}{formatVND(m.netBalance)}
-                    </Text>
-                    <Text style={styles.memberRatio}>
-                      {m.netBalance >= 0 ? 'Được hoàn' : 'Phải đóng'}
-                    </Text>
-                  </View>
+          return (
+            <View style={styles.tabContent}>
+              {/* Biểu đồ tròn đóng góp quỹ nhóm */}
+              <BeautifulPieChart
+                data={pieChartData}
+                title="💰 Tỉ lệ Đóng góp Quỹ nhóm"
+                centerLabel={memberStates.length.toString()}
+              />
+
+              {/* Bảng Chúa nợ và Chủ nợ */}
+              <View style={styles.debtorCreditorContainer}>
+                {/* Chủ nợ */}
+                <View style={[styles.debtorCreditorCard, styles.creditorCard]}>
+                  <Text style={styles.debtorCreditorHeader}>💰 Chủ nợ (Hoàn tiền)</Text>
+                  {memberStates.filter(m => m.netBalance > 0).length === 0 ? (
+                    <Text style={styles.debtorCreditorEmpty}>Không có chủ nợ</Text>
+                  ) : (
+                    memberStates
+                      .filter(m => m.netBalance > 0)
+                      .sort((a, b) => b.netBalance - a.netBalance)
+                      .map((m, mIdx) => (
+                        <View key={`${m.userId}-${mIdx}`} style={styles.debtorCreditorRow}>
+                          <Text style={styles.debtorCreditorName} numberOfLines={1}>🟢 {m.displayName}</Text>
+                          <Text style={styles.debtorCreditorAmount}>+{formatVND(m.netBalance)}</Text>
+                        </View>
+                      ))
+                  )}
                 </View>
-              ))}
+
+                {/* Chúa nợ */}
+                <View style={[styles.debtorCreditorCard, styles.debtorCard]}>
+                  <Text style={styles.debtorCreditorHeader}>👑 Chúa nợ (Phải đóng)</Text>
+                  {memberStates.filter(m => m.netBalance < 0).length === 0 ? (
+                    <Text style={styles.debtorCreditorEmpty}>Không có chúa nợ</Text>
+                  ) : (
+                    memberStates
+                      .filter(m => m.netBalance < 0)
+                      .sort((a, b) => a.netBalance - b.netBalance)
+                      .map((m, mIdx) => (
+                        <View key={`${m.userId}-${mIdx}`} style={styles.debtorCreditorRow}>
+                          <Text style={styles.debtorCreditorName} numberOfLines={1}>🔴 {m.displayName}</Text>
+                          <Text style={styles.debtorCreditorAmount}>{formatVND(m.netBalance)}</Text>
+                        </View>
+                      ))
+                  )}
+                </View>
+              </View>
+
+              <View style={styles.card}>
+                <Text style={styles.cardTitle}>📊 Bảng cân đối Số dư Ròng (Net Balance)</Text>
+                <Text style={styles.cardDesc}>
+                  Số tiền thực tế mỗi người được nhận lại (+) hoặc cần phải nộp thêm (-) để đưa toàn bộ chuyến đi về trạng thái cân bằng.
+                  {'\n'}
+                  <Text style={styles.boldText}>Net Balance = (Nạp quỹ) + (Tự ứng) - (Tiền gánh splits)</Text>
+                </Text>
+
+                {memberStates.map((m, idx) => {
+                  const percent = totalTripSpent > 0 ? (m.totalSpent / totalTripSpent) * 100 : 0;
+                  const color = MEMBER_COLORS[idx % MEMBER_COLORS.length];
+                  return (
+                    <View key={m.userId} style={styles.balanceItemContainer}>
+                      <View style={styles.balanceItem}>
+                        <View style={styles.memberInfo}>
+                          <View style={[styles.avatar, { backgroundColor: color }]}>
+                            <Text style={styles.avatarText}>{(m.displayName || 'Thành viên').charAt(0).toUpperCase()}</Text>
+                          </View>
+                          <View style={{ flex: 1 }}>
+                            <Text style={styles.memberName}>{m.displayName || 'Thành viên'}</Text>
+                            <Text style={styles.memberContribution}>
+                              Nạp quỹ: {formatVND(m.totalContributed)} | Ứng túi: {formatVND(m.totalPaidOutOfPocket)}
+                            </Text>
+                            <Text style={styles.memberContribution}>
+                              Tiền gánh splits: {formatVND(m.totalSpent)} ({percent.toFixed(1)}%)
+                            </Text>
+                          </View>
+                        </View>
+                        <View style={styles.balanceRight}>
+                          <Text style={[styles.memberBalance, m.netBalance >= 0 ? styles.positiveText : styles.negativeText]}>
+                            {m.netBalance >= 0 ? '+' : ''}{formatVND(m.netBalance)}
+                          </Text>
+                          <Text style={styles.memberRatio}>
+                            {m.netBalance >= 0 ? 'Được hoàn' : 'Phải đóng'}
+                          </Text>
+                        </View>
+                      </View>
+                      
+                      {/* Progress Bar dưới tên từng thành viên */}
+                      {totalTripSpent > 0 && (
+                        <View style={styles.memberProgressBarBg}>
+                          <View 
+                            style={[
+                              styles.memberProgressBarFill, 
+                              { 
+                                width: `${percent}%`, 
+                                backgroundColor: color 
+                              }
+                            ]} 
+                          />
+                        </View>
+                      )}
+                    </View>
+                  );
+                })}
+              </View>
             </View>
-          </View>
-        )}
+          );
+        })()}
 
         {/* TAB 2: LỊCH SỬ CHI TIÊU VÀ PHÂN CHIA CHI TIẾT */}
         {activeTab === 'expenses' && (
           <View style={styles.tabContent}>
-            <Text style={styles.sectionTitle}>Danh sách hóa đơn chuyến đi</Text>
+            <View style={styles.expensesHeaderRow}>
+              <Text style={styles.sectionTitle}>Danh sách hóa đơn</Text>
+              {expenses.length > 0 && (
+                <TouchableOpacity style={styles.exportButton} onPress={handleExportCSV}>
+                  <Text style={styles.exportButtonText}>📥 Xuất dữ liệu CSV</Text>
+                </TouchableOpacity>
+              )}
+            </View>
             {expenses.length === 0 ? (
               <View style={styles.emptyContainer}>
                 <Text style={styles.emptyEmoji}>💸</Text>
                 <Text style={styles.emptyText}>Chưa có khoản chi tiêu nào được ghi nhận cho chuyến đi này.</Text>
               </View>
             ) : (
-              expenses.map(exp => (
-                <View key={exp.id} style={styles.expenseCard}>
-                  <View style={styles.expenseHeader}>
-                    <View style={{ flex: 1, paddingRight: 8 }}>
-                      <Text style={styles.expenseDesc}>{exp.description}</Text>
-                      <Text style={styles.expensePaidBy}>
-                        Nguồn chi: <Text style={styles.boldText}>{exp.paidByName}</Text>
-                      </Text>
-                    </View>
-                    <Text style={styles.expenseAmount}>{formatVND(exp.total_amount)}</Text>
-                  </View>
+              expenses.map(exp => {
+                const avatarBgColor = MEMBER_COLORS[exp.id % MEMBER_COLORS.length];
+                const initial = exp.paidByName ? exp.paidByName.charAt(0).toUpperCase() : '🏦';
 
-                  <View style={styles.divider} />
+                return (
+                  <TouchableOpacity
+                    key={exp.id}
+                    style={styles.expenseCard}
+                    activeOpacity={0.7}
+                    onPress={() => {
+                      setSelectedExpense(exp);
+                      setExpenseModalVisible(true);
+                    }}
+                  >
+                    <View style={styles.expenseListRow}>
+                      {/* Avatar người trả tiền */}
+                      <View style={[styles.payerAvatar, { backgroundColor: avatarBgColor }]}>
+                        <Text style={styles.payerAvatarText}>{initial}</Text>
+                      </View>
 
-                  <Text style={styles.splitListTitle}>Phân rã hóa đơn hạch toán:</Text>
-                  <View style={styles.splitList}>
-                    {exp.splits.map((s, idx) => (
-                      <View key={idx} style={styles.splitRow}>
-                        <Text style={styles.splitMemberName}>• {s.displayName}</Text>
-                        <View style={styles.splitAmountContainer}>
-                          <Text style={styles.splitRatio}>({(s.ratio * 100).toFixed(1)}%)</Text>
-                          <Text style={styles.splitAmount}>{formatVND(s.calculatedAmount)}</Text>
+                      <View style={{ flex: 1, marginLeft: 12 }}>
+                        <View style={styles.expensesHeaderRow}>
+                          <Text style={styles.expenseDesc} numberOfLines={1}>{exp.description}</Text>
+                          <Text style={styles.expenseAmount}>{formatVND(exp.total_amount)}</Text>
+                        </View>
+
+                        <View style={styles.expenseSubRow}>
+                          <Text style={styles.expensePaidBy}>
+                            Nguồn chi: <Text style={styles.boldText}>{exp.paidByName}</Text>
+                          </Text>
+                          {/* Trạng thái sync */}
+                          <View style={styles.syncBadge}>
+                            <Text style={styles.syncBadgeText}>☁️ Đã lưu đám mây</Text>
+                          </View>
+                        </View>
+                        
+                        <View style={styles.expenseFooterRow}>
+                          <Text style={styles.expenseDate}>{exp.created_at}</Text>
+                          {exp.billImageUri ? (
+                            <View style={styles.viewBillBadge}>
+                              <Text style={styles.viewBillBadgeText}>📄 Có ảnh hóa đơn</Text>
+                            </View>
+                          ) : null}
                         </View>
                       </View>
-                    ))}
-                  </View>
-                  <View style={styles.expenseFooterRow}>
-                    <Text style={styles.expenseDate}>{exp.created_at}</Text>
-                    {exp.billImageUri ? (
-                      <TouchableOpacity 
-                        style={styles.viewBillBadge}
-                        onPress={() => setPreviewImageUri(exp.billImageUri || null)}
-                      >
-                        <Text style={styles.viewBillBadgeText}>📄 Xem ảnh hóa đơn</Text>
-                      </TouchableOpacity>
-                    ) : null}
-                  </View>
-                </View>
-              ))
+                    </View>
+                  </TouchableOpacity>
+                );
+              })
             )}
           </View>
         )}
@@ -861,98 +1022,6 @@ ${fullText}
               
               {/* KHU VỰC THIẾT LẬP AI OCR */}
               <View style={styles.aiConfigContainer}>
-                <View style={styles.aiConfigHeader}>
-                  <Text style={styles.aiConfigTitle}>🤖 Động cơ AI phân tích hóa đơn</Text>
-                  <TouchableOpacity onPress={() => setShowAiSettings(!showAiSettings)}>
-                    <Text style={styles.aiSettingsToggle}>{showAiSettings ? '▼ Ẩn cấu hình' : '⚙️ Cài đặt'}</Text>
-                  </TouchableOpacity>
-                </View>
-
-                {showAiSettings && (
-                  <View style={styles.aiSettingsBox}>
-                    <Text style={styles.aiSettingsLabel}>Chế độ nhận diện:</Text>
-                    <View style={styles.aiModeRow}>
-                      <TouchableOpacity
-                        style={[styles.aiModeButton, aiMode === 'heuristics' && styles.aiModeButtonActive]}
-                        onPress={async () => {
-                          setAiMode('heuristics');
-                          await saveAiSetting('ai_mode', 'heuristics');
-                        }}
-                      >
-                        <Text style={[styles.aiModeButtonText, aiMode === 'heuristics' && styles.aiModeButtonTextActive]}>
-                          ⚡ Heuristics
-                        </Text>
-                      </TouchableOpacity>
-                      <TouchableOpacity
-                        style={[styles.aiModeButton, aiMode === 'llamacpp' && styles.aiModeButtonActive]}
-                        onPress={async () => {
-                          setAiMode('llamacpp');
-                          await saveAiSetting('ai_mode', 'llamacpp');
-                        }}
-                      >
-                        <Text style={[styles.aiModeButtonText, aiMode === 'llamacpp' && styles.aiModeButtonTextActive]}>
-                          💻 Laptop Server
-                        </Text>
-                      </TouchableOpacity>
-                      <TouchableOpacity
-                        style={[styles.aiModeButton, aiMode === 'ondevice_llm' && styles.aiModeButtonActive]}
-                        onPress={async () => {
-                          setAiMode('ondevice_llm');
-                          await saveAiSetting('ai_mode', 'ondevice_llm');
-                        }}
-                      >
-                        <Text style={[styles.aiModeButtonText, aiMode === 'ondevice_llm' && styles.aiModeButtonTextActive]}>
-                          📱 On-Device LLM
-                        </Text>
-                      </TouchableOpacity>
-                    </View>
-
-                    {aiMode === 'llamacpp' && (
-                      <View style={styles.llamaUrlContainer}>
-                        <Text style={styles.aiSettingsLabel}>Llama Server API URL:</Text>
-                        <TextInput
-                          style={styles.llamaUrlInput}
-                          value={llamaServerUrl}
-                          onChangeText={async (val) => {
-                            setLlamaServerUrl(val);
-                            await saveAiSetting('llama_server_url', val);
-                          }}
-                          placeholder="http://192.168.1.50:8080"
-                        />
-                      </View>
-                    )}
-
-                    {aiMode === 'ondevice_llm' && (
-                      <View style={styles.llamaUrlContainer}>
-                        <Text style={styles.aiSettingsLabel}>Mô hình AI cục bộ trên điện thoại (Offline):</Text>
-                        {isModelReady ? (
-                          <View style={styles.modelReadyBox}>
-                            <Text style={styles.modelReadyText}>✅ Qwen-1.5B đã sẵn sàng (950MB)</Text>
-                            <TouchableOpacity onPress={handleDownloadModel} style={styles.modelRedownloadBtn}>
-                              <Text style={styles.modelRedownloadText}>Tải lại 🔄</Text>
-                            </TouchableOpacity>
-                          </View>
-                        ) : (
-                          <View>
-                            {isDownloadingModel ? (
-                              <View style={styles.downloadProgressBox}>
-                                <Text style={styles.downloadProgressText}>📥 Đang tải mô hình: {modelDownloadProgress}%</Text>
-                                <View style={styles.progressBarBg}>
-                                  <View style={[styles.progressBarFill, { width: `${modelDownloadProgress}%` }]} />
-                                </View>
-                              </View>
-                            ) : (
-                              <TouchableOpacity style={styles.downloadModelBtn} onPress={handleDownloadModel}>
-                                <Text style={styles.downloadModelBtnText}>📥 Tải mô hình AI On-Device (~950MB)</Text>
-                              </TouchableOpacity>
-                            )}
-                          </View>
-                        )}
-                      </View>
-                    )}
-                  </View>
-                )}
-
                 {/* NÚT CHỤP / CHỌN ẢNH HOÁ ĐƠN */}
                 <View style={styles.ocrButtonRow}>
                   <TouchableOpacity style={styles.ocrTriggerButton} onPress={handleCaptureInvoice}>
@@ -1103,7 +1172,19 @@ ${fullText}
         {activeTab === 'settlement' && (
           <View style={styles.tabContent}>
             <View style={styles.card}>
-              <Text style={styles.cardTitle}>🤝 Quyết toán thông minh (Tối giản chuyển tiền)</Text>
+              <View style={styles.settlementHeaderRow}>
+                <View style={{ flex: 1, marginRight: 8 }}>
+                  <Text style={styles.cardTitle}>🤝 Quyết toán thông minh (Tối giản chuyển tiền)</Text>
+                </View>
+                <TouchableOpacity
+                  style={styles.lightbulbButton}
+                  onPress={() => setShowAboutSettlementModal(true)}
+                  activeOpacity={0.7}
+                >
+                  <Text style={styles.lightbulbButtonText}>💡</Text>
+                </TouchableOpacity>
+              </View>
+
               <Text style={styles.cardDesc}>
                 Nhóm của bạn muốn kết thúc chuyến đi và cân bằng tài chính? Chỉ cần những người âm tiền chuyển khoản đúng số tiền dưới đây cho người dư dôi, toàn bộ nhóm sẽ hoàn toàn sòng phẳng!
               </Text>
@@ -1116,29 +1197,44 @@ ${fullText}
                     Cả nhóm đã hoàn thành chia tiền sòng phẳng tuyệt đối. Không cần thêm bất kỳ giao dịch chuyển tiền cấn trừ nào khác.
                   </Text>
                 </View>
+              ) : !isSettlementActive ? (
+                <View style={styles.initialSettlementView}>
+                  <Text style={styles.settlementPromptText}>
+                    Hệ thống đã sẵn sàng tính toán phương án chuyển tiền tối giản nhất cho nhóm của bạn.
+                  </Text>
+
+                  <TouchableOpacity
+                    style={styles.startSettlementBtn}
+                    onPress={() => setIsSettlementActive(true)}
+                    activeOpacity={0.8}
+                  >
+                    <Text style={styles.startSettlementBtnText}>🚀 Bắt đầu Quyết toán</Text>
+                  </TouchableOpacity>
+                </View>
               ) : (
                 <View style={styles.transactionList}>
-                  {debtTransactions.map((tx, idx) => (
-                    <View key={idx} style={styles.transactionItem}>
-                      <View style={styles.txLine}>
-                        <Text style={styles.txFromName}>{tx.fromDisplayName}</Text>
-                        <Text style={styles.txArrow}>👉 chuyển khoản</Text>
-                        <Text style={styles.txAmount}>{formatVND(tx.amount)}</Text>
-                        <Text style={styles.txArrow}>cho</Text>
-                        <Text style={styles.txToName}>{tx.toDisplayName}</Text>
-                      </View>
-                    </View>
-                  ))}
-                  
-                  <View style={styles.warningCard}>
-                    <Text style={styles.warningTitle}>💡 Ý nghĩa quyết toán:</Text>
-                    <Text style={styles.warningText}>
-                      • Các con nợ gánh nhiều hóa đơn hơn phần nộp quỹ ban đầu sẽ cấn trừ chuyển khoản thẳng cho chủ nợ (người nạp dư quỹ hoặc ứng nhiều tiền túi hơn).
-                    </Text>
-                    <Text style={styles.warningText}>
-                      • Phương pháp tinh giản nợ này triệt tiêu số lần chuyển khoản trung gian, đem lại sự tiện lợi tối đa cho nhóm.
-                    </Text>
-                  </View>
+                  {debtTransactions.map((tx, idx) => renderTransactionItem(tx, idx))}
+
+                  <TouchableOpacity
+                    style={[styles.completeSettlementBtn, isCompletingSettlement && styles.disabledButton]}
+                    onPress={handleCompleteSettlement}
+                    disabled={isCompletingSettlement}
+                    activeOpacity={0.8}
+                  >
+                    {isCompletingSettlement ? (
+                      <ActivityIndicator size="small" color="#fff" />
+                    ) : (
+                      <Text style={styles.completeSettlementBtnText}>✅ Xác nhận đã chuyển & Hoàn tất Quyết toán</Text>
+                    )}
+                  </TouchableOpacity>
+
+                  <TouchableOpacity
+                    style={styles.cancelSettlementBtn}
+                    onPress={() => setIsSettlementActive(false)}
+                    activeOpacity={0.7}
+                  >
+                    <Text style={styles.cancelSettlementBtnText}>Quay lại</Text>
+                  </TouchableOpacity>
                 </View>
               )}
             </View>
@@ -1174,9 +1270,221 @@ ${fullText}
           </View>
         </SafeAreaView>
       </Modal>
+
+      {/* MODAL GIẢI THÍCH Ý NGHĨA QUYẾT TOÁN (CHÚ THÍCH POPUP) */}
+      <Modal
+        visible={showAboutSettlementModal}
+        transparent={true}
+        animationType="fade"
+        onRequestClose={() => setShowAboutSettlementModal(false)}
+      >
+        <View style={styles.popOverOverlay}>
+          {/* Nhấn ra ngoài nền để đóng popup */}
+          <Pressable 
+            style={StyleSheet.absoluteFill} 
+            onPress={() => setShowAboutSettlementModal(false)} 
+          />
+          
+          <View style={styles.popOverContent}>
+            <View style={styles.popOverHeader}>
+              <Text style={styles.popOverTitle}>💡 Khi nào cần Quyết toán?</Text>
+              <TouchableOpacity onPress={() => setShowAboutSettlementModal(false)}>
+                <Text style={styles.popOverCloseIcon}>✕</Text>
+              </TouchableOpacity>
+            </View>
+            <View style={{ flex: 1, width: '100%' }}>
+              <ScrollView 
+                style={styles.popOverBody} 
+                showsVerticalScrollIndicator={false}
+                contentContainerStyle={{ paddingBottom: 20 }}
+              >
+                {/* Hộp thông báo khi nào cần quyết toán di chuyển vào trong Modal */}
+                <View style={[styles.infoAlertBox, { marginTop: 0, marginBottom: 16 }]}>
+                  <Text style={styles.infoAlertTitle}>🔔 Hướng dẫn quyết toán</Text>
+                  <Text style={styles.infoAlertText}>
+                    • Khi chuyến đi hoặc sự kiện đã kết thúc và nhóm muốn chia đều sòng phẳng toàn bộ chi phí.
+                  </Text>
+                  <Text style={styles.infoAlertText}>
+                    • Khi bạn muốn đưa số dư ròng của các thành viên về 0đ và cân bằng Quỹ chung về 0đ để bắt đầu một đợt chi tiêu hoặc chuyến đi mới.
+                  </Text>
+                </View>
+
+                <Text style={styles.popOverSectionTitle}>1. Số dư Ròng (Net Balance)</Text>
+                <Text style={styles.popOverText}>
+                  Biểu thị số tiền thực tế một thành viên đang thừa hoặc thiếu trong chuyến đi:
+                </Text>
+                <Text style={styles.popOverBullet}>
+                  • <Text style={{fontWeight: 'bold'}}>Số dư âm (Con nợ):</Text> Là người chi tiêu, ăn uống nhiều hơn số tiền họ đã đóng góp hoặc tự ứng. Họ cần chuyển khoản trả tiền cho nhóm.
+                </Text>
+                <Text style={styles.popOverBullet}>
+                  • <Text style={{fontWeight: 'bold'}}>Số dư dương (Chủ nợ):</Text> Là người đã nộp quỹ nhiều hoặc tự rút tiền túi ứng trước cho nhóm chi tiêu. Họ cần nhận lại tiền bù đắp từ các thành viên khác.
+                </Text>
+
+                <Text style={styles.popOverSectionTitle}>2. Tinh giản nợ thông minh</Text>
+                <Text style={styles.popOverText}>
+                  Thay vì mọi người phải chuyển tiền lẻ tẻ qua lại lẫn nhau nhiều lần, ứng dụng sử dụng thuật toán cấn trừ nợ nâng cao (tương tự Splitwise).
+                </Text>
+                <Text style={styles.popOverText}>
+                  Thuật toán sẽ tính toán và gom các khoản nợ lại để đưa ra số lượt chuyển tiền **tối thiểu**, chuyển khoản trực tiếp từ người nợ nhiều nhất đến người nhận nhiều nhất.
+                </Text>
+
+                <Text style={styles.popOverSectionTitle}>3. Sự tham gia của Quỹ chung</Text>
+                <Text style={styles.popOverText}>
+                  Nếu nhóm có chi tiêu trực tiếp bằng Quỹ chung và dẫn đến Quỹ chung bị âm hoặc dương, Quỹ chung sẽ tham gia vào quyết toán như một thành viên:
+                </Text>
+                <Text style={styles.popOverBullet}>
+                  • Nếu <Text style={{fontWeight: 'bold', color: '#EF4444'}}>Quỹ chung bị âm</Text>, các thành viên nợ tiền cần nộp tiền vào Quỹ chung để bù đắp phần đã chi lạm phát.
+                </Text>
+                <Text style={styles.popOverBullet}>
+                  • Nếu <Text style={{fontWeight: 'bold', color: '#10B981'}}>Quỹ chung còn dư</Text>, số tiền thừa đó sẽ được rút ra hoàn trả lại sòng phẳng cho những người đã đóng dư ban đầu.
+                </Text>
+              </ScrollView>
+            </View>
+            <TouchableOpacity 
+              style={styles.popOverCloseBtn} 
+              onPress={() => setShowAboutSettlementModal(false)}
+            >
+              <Text style={styles.popOverCloseBtnText}>Đóng</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+
+      {/* Modal chi tiết hóa đơn, ảnh hóa đơn & phân rã gánh nợ */}
+      <Modal
+        visible={expenseModalVisible}
+        transparent={true}
+        animationType="fade"
+        onRequestClose={() => setExpenseModalVisible(false)}
+      >
+        <View style={styles.popOverOverlay}>
+          <Pressable 
+            style={StyleSheet.absoluteFill} 
+            onPress={() => setExpenseModalVisible(false)} 
+          />
+          
+          <View style={[styles.popOverContent, { height: SCREEN_HEIGHT * 0.82 }]}>
+            <View style={styles.popOverHeader}>
+              <Text style={styles.popOverTitle}>📝 Chi tiết Chi tiêu</Text>
+              <TouchableOpacity onPress={() => setExpenseModalVisible(false)}>
+                <Text style={styles.popOverCloseIcon}>✕</Text>
+              </TouchableOpacity>
+            </View>
+
+            {selectedExpense && (
+              <View style={{ flex: 1, width: '100%' }}>
+                <ScrollView 
+                  style={styles.popOverBody} 
+                  showsVerticalScrollIndicator={false}
+                  contentContainerStyle={{ paddingBottom: 20 }}
+                >
+                  <View style={styles.modalInfoCard}>
+                    <Text style={styles.modalExpenseDesc}>{selectedExpense.description}</Text>
+                    <Text style={styles.modalExpenseAmount}>{formatVND(selectedExpense.total_amount)}</Text>
+                    
+                    <View style={styles.modalInfoRow}>
+                      <Text style={styles.modalInfoLabel}>Nguồn chi trả:</Text>
+                      <Text style={styles.modalInfoValue}>{selectedExpense.paidByName}</Text>
+                    </View>
+                    
+                    <View style={styles.modalInfoRow}>
+                      <Text style={styles.modalInfoLabel}>Ngày tạo:</Text>
+                      <Text style={styles.modalInfoValue}>{selectedExpense.created_at}</Text>
+                    </View>
+
+                    <View style={styles.modalInfoRow}>
+                      <Text style={styles.modalInfoLabel}>Trạng thái đồng bộ:</Text>
+                      <View style={[styles.syncBadge, { marginHorizontal: 0 }]}>
+                        <Text style={styles.syncBadgeText}>☁️ Đã lưu đám mây</Text>
+                      </View>
+                    </View>
+                  </View>
+
+                  {/* Phần rã splits gánh nợ */}
+                  <Text style={styles.modalSectionTitle}>📊 Bảng phân rã gánh nợ</Text>
+                  <View style={styles.splitsTable}>
+                    <View style={styles.tableHeaderRow}>
+                      <Text style={[styles.tableHeaderCell, { flex: 2 }]}>Thành viên</Text>
+                      <Text style={[styles.tableHeaderCell, { flex: 1, textAlign: 'center' }]}>Tỉ lệ</Text>
+                      <Text style={[styles.tableHeaderCell, { flex: 2, textAlign: 'right' }]}>Số tiền gánh</Text>
+                    </View>
+                    
+                    {selectedExpense.splits.map((split, sIdx) => {
+                      const cellColor = MEMBER_COLORS[sIdx % MEMBER_COLORS.length];
+                      return (
+                        <View key={sIdx} style={styles.tableBodyRow}>
+                          <View style={{ flex: 2, flexDirection: 'row', alignItems: 'center' }}>
+                            <View style={[styles.tableAvatar, { backgroundColor: cellColor }]}>
+                              <Text style={styles.tableAvatarText}>{(split.displayName || 'Thành viên').charAt(0).toUpperCase()}</Text>
+                            </View>
+                            <Text style={styles.tableMemberName}>{split.displayName || 'Thành viên'}</Text>
+                          </View>
+                          <Text style={[styles.tableBodyCell, { flex: 1, textAlign: 'center', fontWeight: '600', color: '#64748B' }]}>
+                            {(split.ratio * 100).toFixed(1)}%
+                          </Text>
+                          <Text style={[styles.tableBodyCell, { flex: 2, textAlign: 'right', fontWeight: 'bold', color: '#1E293B' }]}>
+                            {formatVND(split.calculatedAmount)}
+                          </Text>
+                        </View>
+                      );
+                    })}
+                  </View>
+
+                  {/* Ảnh hóa đơn đính kèm */}
+                  <Text style={styles.modalSectionTitle}>🖼️ Ảnh hóa đơn / Biên lai</Text>
+                  {selectedExpense.billImageUri ? (
+                    <View style={styles.modalBillImageContainer}>
+                      <Image
+                        source={{ uri: selectedExpense.billImageUri }}
+                        style={styles.modalBillImage}
+                        resizeMode="contain"
+                      />
+                      <TouchableOpacity
+                        style={styles.zoomImageBtn}
+                        onPress={() => {
+                          setPreviewImageUri(selectedExpense.billImageUri || null);
+                        }}
+                      >
+                        <Text style={styles.zoomImageBtnText}>🔍 Thu phóng ảnh</Text>
+                      </TouchableOpacity>
+                    </View>
+                  ) : (
+                    <View style={styles.emptyImagePlaceholder}>
+                      <Text style={styles.emptyImagePlaceholderIcon}>📄</Text>
+                      <Text style={styles.emptyImagePlaceholderText}>Hóa đơn này không đính kèm ảnh chụp biên lai.</Text>
+                    </View>
+                  )}
+                </ScrollView>
+              </View>
+            )}
+
+            <TouchableOpacity 
+              style={styles.popOverCloseBtn} 
+              onPress={() => setExpenseModalVisible(false)}
+            >
+              <Text style={styles.popOverCloseBtnText}>Đóng</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+
+      {/* Toast Notification nội bộ */}
+      {toastVisible && (
+        <View style={styles.toastContainer}>
+          <View style={styles.toastCard}>
+            <View style={styles.toastHeaderRow}>
+              <Text style={styles.toastTitle}>🔔 Đồng bộ Realtime</Text>
+              <Text style={styles.toastTime}>Vừa xong</Text>
+            </View>
+            <Text style={styles.toastText}>{toastMessage}</Text>
+          </View>
+        </View>
+      )}
     </SafeAreaView>
   );
 }
+
+const { height: SCREEN_HEIGHT } = Dimensions.get('window');
 
 const styles = StyleSheet.create({
   container: {
@@ -1288,13 +1596,98 @@ const styles = StyleSheet.create({
     lineHeight: 18,
     marginBottom: 16,
   },
+  balanceItemContainer: {
+    borderBottomWidth: 1,
+    borderBottomColor: '#F3F4F6',
+    paddingVertical: 12,
+  },
   balanceItem: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    paddingVertical: 12,
-    borderBottomWidth: 1,
-    borderBottomColor: '#F3F4F6',
+  },
+  memberProgressBarBg: {
+    height: 6,
+    backgroundColor: '#F3F4F6',
+    borderRadius: 3,
+    marginTop: 8,
+    overflow: 'hidden',
+    marginLeft: 52,
+  },
+  memberProgressBarFill: {
+    height: '100%',
+    borderRadius: 3,
+  },
+  aiConfigContainer: {
+    backgroundColor: '#F3F4F6',
+    borderRadius: 12,
+    padding: 12,
+    marginBottom: 16,
+    borderWidth: 1,
+    borderColor: '#E5E7EB',
+  },
+  chartCard: {
+    backgroundColor: '#FFFFFF',
+    borderRadius: 16,
+    padding: 16,
+    marginBottom: 16,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.05,
+    shadowRadius: 6,
+    elevation: 2,
+  },
+  chartCardTitle: {
+    fontSize: 14,
+    fontWeight: 'bold',
+    color: '#374151',
+    marginBottom: 12,
+  },
+  stackedBarContainer: {
+    flexDirection: 'row',
+    height: 16,
+    borderRadius: 8,
+    overflow: 'hidden',
+    backgroundColor: '#E5E7EB',
+    marginBottom: 12,
+  },
+  legendContainer: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+  },
+  legendItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginRight: 12,
+  },
+  legendDot: {
+    width: 10,
+    height: 10,
+    borderRadius: 5,
+    marginRight: 4,
+  },
+  legendText: {
+    fontSize: 11,
+    color: '#6B7280',
+    fontWeight: '500',
+  },
+  expensesHeaderRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 12,
+  },
+  exportButton: {
+    backgroundColor: '#1E3A8A',
+    paddingVertical: 6,
+    paddingHorizontal: 12,
+    borderRadius: 8,
+  },
+  exportButtonText: {
+    color: '#FFFFFF',
+    fontSize: 12,
+    fontWeight: 'bold',
   },
   memberInfo: {
     flexDirection: 'row',
@@ -1379,6 +1772,8 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: 'bold',
     color: '#1F2937',
+    flex: 1,
+    marginRight: 8,
   },
   expensePaidBy: {
     fontSize: 12,
@@ -1629,169 +2024,7 @@ const styles = StyleSheet.create({
     fontWeight: 'bold',
     color: '#10B981',
   },
-  warningCard: {
-    backgroundColor: '#FFFBEB',
-    borderWidth: 1,
-    borderColor: '#FDE68A',
-    borderRadius: 12,
-    padding: 12,
-    marginTop: 12,
-  },
-  warningTitle: {
-    fontSize: 13,
-    fontWeight: 'bold',
-    color: '#B45309',
-    marginBottom: 6,
-  },
-  warningText: {
-    fontSize: 12,
-    color: '#78350F',
-    lineHeight: 16,
-    marginBottom: 4,
-  },
-  aiConfigContainer: {
-    backgroundColor: '#F3F4F6',
-    borderRadius: 12,
-    padding: 12,
-    marginBottom: 16,
-    borderWidth: 1,
-    borderColor: '#E5E7EB',
-  },
-  aiConfigHeader: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    marginBottom: 8,
-  },
-  aiConfigTitle: {
-    fontSize: 13,
-    fontWeight: 'bold',
-    color: '#1E3A8A',
-  },
-  aiSettingsToggle: {
-    fontSize: 12,
-    color: '#3B82F6',
-    fontWeight: '600',
-  },
-  aiSettingsBox: {
-    backgroundColor: '#FFFFFF',
-    borderRadius: 8,
-    padding: 10,
-    marginBottom: 12,
-    borderWidth: 1,
-    borderColor: '#E5E7EB',
-  },
-  aiSettingsLabel: {
-    fontSize: 11,
-    color: '#4B5563',
-    fontWeight: '600',
-    marginBottom: 4,
-  },
-  aiModeRow: {
-    flexDirection: 'row',
-    gap: 8,
-    marginBottom: 8,
-  },
-  aiModeButton: {
-    flex: 1,
-    backgroundColor: '#F3F4F6',
-    borderRadius: 6,
-    paddingVertical: 8,
-    alignItems: 'center',
-    borderWidth: 1,
-    borderColor: '#D1D5DB',
-  },
-  aiModeButtonActive: {
-    backgroundColor: '#DBEAFE',
-    borderColor: '#3B82F6',
-  },
-  aiModeButtonText: {
-    fontSize: 11,
-    color: '#4B5563',
-    fontWeight: '500',
-  },
-  aiModeButtonTextActive: {
-    color: '#1E3A8A',
-    fontWeight: 'bold',
-  },
-  llamaUrlContainer: {
-    marginTop: 4,
-  },
-  llamaUrlInput: {
-    backgroundColor: '#F3F4F6',
-    borderRadius: 6,
-    paddingHorizontal: 8,
-    paddingVertical: 6,
-    fontSize: 12,
-    color: '#1F2937',
-    borderWidth: 1,
-    borderColor: '#D1D5DB',
-  },
-  modelReadyBox: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    backgroundColor: '#ECFDF5',
-    borderRadius: 6,
-    padding: 8,
-    borderWidth: 1,
-    borderColor: '#A7F3D0',
-    marginTop: 4,
-  },
-  modelReadyText: {
-    fontSize: 12,
-    color: '#065F46',
-    fontWeight: '600',
-  },
-  modelRedownloadBtn: {
-    paddingHorizontal: 8,
-    paddingVertical: 4,
-    backgroundColor: '#D1FAE5',
-    borderRadius: 4,
-  },
-  modelRedownloadText: {
-    fontSize: 11,
-    color: '#047857',
-    fontWeight: 'bold',
-  },
-  downloadProgressBox: {
-    backgroundColor: '#F9FAFB',
-    borderRadius: 6,
-    padding: 10,
-    borderWidth: 1,
-    borderColor: '#E5E7EB',
-    marginTop: 4,
-  },
-  downloadProgressText: {
-    fontSize: 12,
-    color: '#1E3A8A',
-    fontWeight: 'bold',
-    marginBottom: 6,
-  },
-  progressBarBg: {
-    height: 8,
-    backgroundColor: '#E5E7EB',
-    borderRadius: 4,
-    overflow: 'hidden',
-  },
-  progressBarFill: {
-    height: '100%',
-    backgroundColor: '#3B82F6',
-    borderRadius: 4,
-  },
-  downloadModelBtn: {
-    backgroundColor: '#3B82F6',
-    borderRadius: 6,
-    paddingVertical: 10,
-    alignItems: 'center',
-    justifyContent: 'center',
-    marginTop: 4,
-  },
-  downloadModelBtnText: {
-    color: '#FFFFFF',
-    fontWeight: 'bold',
-    fontSize: 12,
-  },
+
   ocrButtonRow: {
     flexDirection: 'row',
     gap: 10,
@@ -1911,6 +2144,491 @@ const styles = StyleSheet.create({
   modalFullImage: {
     width: '100%',
     height: '100%',
+  },
+  settlementHeaderRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 12,
+  },
+  lightbulbButton: {
+    backgroundColor: '#EFF6FF',
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    borderWidth: 1,
+    borderColor: '#3B82F6',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  lightbulbButtonText: {
+    fontSize: 16,
+  },
+  initialSettlementView: {
+    alignItems: 'center',
+    paddingVertical: 10,
+  },
+  infoAlertBox: {
+    backgroundColor: '#FFFBEB',
+    borderColor: '#F59E0B',
+    borderWidth: 1,
+    borderRadius: 12,
+    padding: 14,
+    width: '100%',
+    marginBottom: 16,
+  },
+  infoAlertTitle: {
+    fontSize: 14,
+    fontWeight: 'bold',
+    color: '#B45309',
+    marginBottom: 6,
+  },
+  infoAlertText: {
+    fontSize: 12,
+    color: '#78350F',
+    lineHeight: 18,
+    marginBottom: 4,
+  },
+  settlementPromptText: {
+    fontSize: 13,
+    color: '#4B5563',
+    textAlign: 'center',
+    lineHeight: 18,
+    marginBottom: 20,
+    paddingHorizontal: 10,
+  },
+  startSettlementBtn: {
+    backgroundColor: '#10B981',
+    borderRadius: 12,
+    paddingVertical: 14,
+    paddingHorizontal: 24,
+    alignItems: 'center',
+    justifyContent: 'center',
+    width: '100%',
+    elevation: 4,
+    shadowColor: '#10B981',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.2,
+    shadowRadius: 4,
+  },
+  startSettlementBtnText: {
+    color: '#FFFFFF',
+    fontWeight: 'bold',
+    fontSize: 16,
+  },
+  completeSettlementBtn: {
+    backgroundColor: '#1E3A8A',
+    borderRadius: 12,
+    paddingVertical: 14,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginTop: 20,
+    width: '100%',
+  },
+  completeSettlementBtnText: {
+    color: '#FFFFFF',
+    fontWeight: 'bold',
+    fontSize: 15,
+  },
+  cancelSettlementBtn: {
+    marginTop: 12,
+    paddingVertical: 10,
+    alignItems: 'center',
+    justifyContent: 'center',
+    width: '100%',
+  },
+  cancelSettlementBtnText: {
+    color: '#4B5563',
+    fontWeight: '600',
+    fontSize: 14,
+    textDecorationLine: 'underline',
+  },
+  popOverOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0, 0, 0, 0.6)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: 24,
+  },
+  popOverContent: {
+    backgroundColor: '#FFFFFF',
+    borderRadius: 24,
+    padding: 24,
+    width: '100%',
+    height: SCREEN_HEIGHT * 0.7,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.3,
+    shadowRadius: 12,
+    elevation: 10,
+  },
+  popOverHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    borderBottomWidth: 1,
+    borderBottomColor: '#F3F4F6',
+    paddingBottom: 14,
+    marginBottom: 16,
+  },
+  popOverTitle: {
+    fontSize: 18,
+    fontWeight: 'bold',
+    color: '#1F2937',
+  },
+  popOverCloseIcon: {
+    fontSize: 20,
+    color: '#9CA3AF',
+    fontWeight: 'bold',
+    padding: 4,
+  },
+  popOverBody: {
+    width: '100%',
+    flex: 1,
+    marginVertical: 8,
+  },
+  popOverSectionTitle: {
+    fontSize: 14,
+    fontWeight: 'bold',
+    color: '#1E3A8A',
+    marginTop: 12,
+    marginBottom: 6,
+  },
+  popOverText: {
+    fontSize: 13,
+    color: '#4B5563',
+    lineHeight: 18,
+    marginBottom: 8,
+  },
+  popOverBullet: {
+    fontSize: 13,
+    color: '#4B5563',
+    lineHeight: 18,
+    marginBottom: 6,
+    paddingLeft: 8,
+  },
+  popOverCloseBtn: {
+    backgroundColor: '#1E3A8A',
+    borderRadius: 12,
+    paddingVertical: 12,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginTop: 18,
+  },
+  popOverCloseBtnText: {
+    color: '#FFFFFF',
+    fontWeight: 'bold',
+    fontSize: 15,
+  },
+  toastContainer: {
+    position: 'absolute',
+    top: Platform.OS === 'ios' ? 50 : 30,
+    left: 16,
+    right: 16,
+    zIndex: 9999,
+  },
+  toastCard: {
+    backgroundColor: '#1E293B',
+    borderRadius: 12,
+    padding: 14,
+    shadowColor: '#000000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.15,
+    shadowRadius: 12,
+    elevation: 8,
+    borderLeftWidth: 4,
+    borderLeftColor: '#10B981',
+  },
+  toastHeaderRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 4,
+  },
+  toastTitle: {
+    fontSize: 13,
+    fontWeight: 'bold',
+    color: '#34D399',
+  },
+  toastTime: {
+    fontSize: 10,
+    color: '#94A3B8',
+  },
+  toastText: {
+    fontSize: 13,
+    color: '#F8FAFC',
+    fontWeight: '500',
+  },
+  debtorCreditorContainer: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginVertical: 12,
+    paddingHorizontal: 4,
+  },
+  debtorCreditorCard: {
+    flex: 1,
+    borderRadius: 12,
+    padding: 12,
+    marginHorizontal: 4,
+    shadowColor: '#000000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.05,
+    shadowRadius: 4,
+    elevation: 1,
+  },
+  creditorCard: {
+    backgroundColor: '#ECFDF5',
+    borderWidth: 1,
+    borderColor: '#A7F3D0',
+  },
+  debtorCard: {
+    backgroundColor: '#FEF2F2',
+    borderWidth: 1,
+    borderColor: '#FCA5A5',
+  },
+  debtorCreditorHeader: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: '#1E293B',
+    marginBottom: 8,
+  },
+  debtorCreditorRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginVertical: 4,
+  },
+  debtorCreditorName: {
+    fontSize: 12,
+    fontWeight: '500',
+    color: '#334155',
+    flex: 1,
+  },
+  debtorCreditorAmount: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#0F172A',
+  },
+  debtorCreditorEmpty: {
+    fontSize: 12,
+    color: '#94A3B8',
+    fontStyle: 'italic',
+    textAlign: 'center',
+    marginTop: 8,
+  },
+  expenseListRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  payerAvatar: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  payerAvatarText: {
+    color: '#FFFFFF',
+    fontWeight: 'bold',
+    fontSize: 16,
+  },
+  expenseSubRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginTop: 4,
+  },
+  syncBadge: {
+    backgroundColor: '#DCFCE7',
+    borderRadius: 12,
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+    marginHorizontal: 4,
+  },
+  syncBadgeText: {
+    color: '#15803D',
+    fontSize: 10,
+    fontWeight: '700',
+  },
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0, 0, 0, 0.5)',
+    justifyContent: 'flex-end',
+  },
+  modalContainer: {
+    backgroundColor: '#FFFFFF',
+    borderTopLeftRadius: 24,
+    borderTopRightRadius: 24,
+    maxHeight: '90%',
+    paddingBottom: 24,
+    flexShrink: 1,
+  },
+  modalHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    padding: 20,
+    borderBottomWidth: 1,
+    borderBottomColor: '#F1F5F9',
+  },
+  modalTitle: {
+    fontSize: 18,
+    fontWeight: 'bold',
+    color: '#0F172A',
+  },
+  modalCloseBtn: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    backgroundColor: '#F1F5F9',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  modalCloseBtnText: {
+    fontSize: 14,
+    color: '#64748B',
+    fontWeight: 'bold',
+  },
+  modalScrollView: {
+    flexGrow: 1,
+    flexShrink: 1,
+  },
+  modalScrollContent: {
+    padding: 20,
+    paddingBottom: 40,
+  },
+  modalInfoCard: {
+    backgroundColor: '#F8FAFC',
+    borderRadius: 16,
+    padding: 16,
+    marginBottom: 20,
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+  },
+  modalExpenseDesc: {
+    fontSize: 20,
+    fontWeight: '800',
+    color: '#0F172A',
+    marginBottom: 6,
+  },
+  modalExpenseAmount: {
+    fontSize: 24,
+    fontWeight: '800',
+    color: '#1E3A8A',
+    marginBottom: 16,
+  },
+  modalInfoRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginVertical: 4,
+  },
+  modalInfoLabel: {
+    fontSize: 13,
+    color: '#64748B',
+    fontWeight: '500',
+  },
+  modalInfoValue: {
+    fontSize: 13,
+    color: '#1E293B',
+    fontWeight: '600',
+  },
+  modalSectionTitle: {
+    fontSize: 15,
+    fontWeight: '700',
+    color: '#1E293B',
+    marginBottom: 12,
+    marginTop: 8,
+  },
+  splitsTable: {
+    backgroundColor: '#FFFFFF',
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+    overflow: 'hidden',
+    marginBottom: 20,
+  },
+  tableHeaderRow: {
+    flexDirection: 'row',
+    backgroundColor: '#F1F5F9',
+    padding: 12,
+  },
+  tableHeaderCell: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#475569',
+  },
+  tableBodyRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    padding: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: '#F1F5F9',
+  },
+  tableBodyCell: {
+    fontSize: 13,
+  },
+  tableAvatar: {
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginRight: 8,
+  },
+  tableAvatarText: {
+    color: '#FFFFFF',
+    fontSize: 11,
+    fontWeight: 'bold',
+  },
+  tableMemberName: {
+    fontSize: 13,
+    fontWeight: '500',
+    color: '#1E293B',
+  },
+  modalBillImageContainer: {
+    backgroundColor: '#F8FAFC',
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+    padding: 8,
+    alignItems: 'center',
+  },
+  modalBillImage: {
+    width: '100%',
+    height: 250,
+    borderRadius: 12,
+  },
+  zoomImageBtn: {
+    backgroundColor: '#1E3A8A',
+    borderRadius: 20,
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    marginTop: 10,
+  },
+  zoomImageBtnText: {
+    color: '#FFFFFF',
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  emptyImagePlaceholder: {
+    backgroundColor: '#F8FAFC',
+    borderRadius: 16,
+    borderWidth: 1,
+    borderStyle: 'dashed',
+    borderColor: '#CBD5E1',
+    padding: 32,
+    alignItems: 'center',
+  },
+  emptyImagePlaceholderIcon: {
+    fontSize: 32,
+    color: '#94A3B8',
+    marginBottom: 8,
+  },
+  emptyImagePlaceholderText: {
+    fontSize: 13,
+    color: '#64748B',
+    textAlign: 'center',
   },
 });
 
