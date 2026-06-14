@@ -4,6 +4,7 @@
     "slug": "cofund-local",
     "version": "1.0.0",
     "orientation": "portrait",
+    "icon": "./assets/icon.png",
     "newArchEnabled": false,
     "android": {
       "package": "com.lirrak.cofundlocal",
